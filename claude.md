@@ -18,9 +18,50 @@ It IS intended to:
 
 ---
 
-## 2. Core Design Philosophy
+## 2. System Architecture — 10-Step Settlement Flow
 
-### 2.1 Settlement > Liveness
+```
+1. User calls fill()
+   ↓
+2. Main contract locks funds, records startTime, endTime, orderId
+   ↓
+3. Backend listens to Filled event, records startTime, endTime, orderId
+   ↓
+4. Backend cronjob scans for expired orders (endTime has passed)
+   ↓
+5. Backend triggers CRE Workflow
+   - Calls MessageEmitter.emitMessage(JSON: {orderId, startTime, endTime})
+   - MessageEmitter emits MessageEmitted event
+   - CRE DON picks up event via Log Trigger
+   ↓
+6. CRE Workflow DON executes:
+   - Each node independently fetches CEX data (for startTime~endTime range)
+   - Each node independently computes VWAP
+   - Circuit breaker checks (coverage gate, outlier scrubbing, staleness, flash crash)
+   - Nodes reach consensus via OCR
+   - Generate signed report
+   ↓
+7. Forwarder writes signed report on-chain
+   - Calls contract's onReport(bytes metadata, bytes report)
+   ↓
+8. On-chain contract verifies and stores:
+   - Verifies signatures from Chainlink DON
+   - Decodes report: orderId, startTime, endTime, priceE8
+   - Stores to mapping: settlements[orderId] = {startTime, endTime, priceE8}
+   - Emits PriceSettled event
+   ↓
+9. Anyone can call settle()
+   - Checks: endTime has passed && price is confirmed
+   - Executes settlement at VWAP price + deltaBps
+   ↓
+10. Backend listens to settlement log, updates order records
+```
+
+---
+
+## 3. Core Design Philosophy
+
+### 3.1 Settlement > Liveness
 
 If data integrity is uncertain:
 → Do NOT settle.
@@ -29,7 +70,21 @@ Fail-closed is preferred over wrong settlement.
 
 ---
 
-### 2.2 Multi-Source, Not Multi-Hop
+### 3.2 On-Demand, Not Continuous
+
+The system operates in **event-driven mode**:
+- CRE does NOT continuously publish prices
+- CRE computes VWAP only when triggered by a settlement request
+- Each computation targets a specific (startTime, endTime) range
+- This avoids unnecessary gas costs and data staleness issues
+
+The trigger chain:
+- Backend → MessageEmitter.emitMessage() → on-chain event
+- CRE DON → Log Trigger → picks up event → computes → writes back
+
+---
+
+### 3.3 Multi-Source, Not Multi-Hop
 
 Each CRE node must:
 - Independently fetch exchange data
@@ -39,7 +94,7 @@ Each CRE node must:
 Nodes must NOT:
 - Rely on a central aggregator service
 - Share a signing key
-- Blindly relay another node’s result
+- Blindly relay another node's result
 
 Security is derived from:
 - Independent computation
@@ -48,7 +103,7 @@ Security is derived from:
 
 ---
 
-### 2.3 Deterministic Computation
+### 3.4 Deterministic Computation
 
 All price calculation logic must be:
 
@@ -57,15 +112,18 @@ All price calculation logic must be:
 - Reproducible from historical data
 
 Given:
-- Window
+- Time window (startTime, endTime)
 - Venue list
 - Raw trade data
 
 Any third party should be able to reproduce the VWAP result.
 
+**Important**: For historical mode, staleness checks use `endTime` as reference
+(not `time.Now()`), ensuring all nodes produce identical results.
+
 ---
 
-## 3. What VWAP Actually Means Here
+## 4. What VWAP Actually Means Here
 
 12h VWAP:
 
@@ -74,7 +132,7 @@ VWAP = Σ(price × volume) / Σ(volume)
 Applied across:
 - Multiple exchanges
 - Filtered venues
-- 12-hour rolling window
+- Specific time window (startTime to endTime, typically 12 hours)
 
 This is NOT:
 - Instant spot price
@@ -85,7 +143,7 @@ VWAP represents historical trading-weighted fair price.
 
 ---
 
-## 4. Why Sanity Checks Are Required
+## 5. Why Sanity Checks Are Required
 
 VWAP alone is insufficient because:
 
@@ -96,13 +154,16 @@ VWAP alone is insufficient because:
 Therefore, the system requires:
 
 1. Coverage gate
-   Minimum percentage of venues available.
+   Minimum number of venues available (>= 3).
 
 2. Dispersion control
-   Detect abnormal cross-venue divergence.
+   Detect abnormal cross-venue divergence (> 2% from median).
 
-3. Optional time-scale sanity reference
-   Compare VWAP_12h vs TWAP_12h (not vs spot).
+3. Staleness check
+   Latest candle must be within 30 minutes of endTime.
+
+4. Flash crash protection
+   VWAP vs median of last candle closes must not diverge > 15%.
 
 Sanity checks protect against:
 - Data corruption
@@ -111,27 +172,28 @@ Sanity checks protect against:
 
 ---
 
-## 5. Oracle Network Model
+## 6. On-Chain Contract Design
 
-CRE Oracle is a **permissioned distributed network**.
+### 6.1 Report Encoding
 
-It is NOT:
-- Fully permissionless
-- Open to arbitrary reporters
+Reuses `UpdateReserves(uint256 totalMinted, uint256 totalReserve)` format
+to avoid generating new Go bindings:
 
-On-chain contract must:
-- Maintain reporter allowlist
-- Require quorum (e.g., 3/5)
-- Aggregate using median
+- `totalMinted` = orderId
+- `totalReserve` = (startTime << 128) | (endTime << 64) | priceE8
 
-Governance must be able to:
-- Add/remove reporters
-- Adjust quorum
-- Update calculation parameters
+### 6.2 VWAPSettlement Contract
+
+Implements IReceiver, stores `orderId → {startTime, endTime, priceE8, settled}`.
+
+### 6.3 Deployed Contracts (Sepolia)
+
+- MessageEmitter: `0x1d598672486ecB50685Da5497390571Ac4E93FDc`
+- ReserveManager: `0x51933aD3A79c770cb6800585325649494120401a` (MVP, to be replaced)
 
 ---
 
-## 6. Security Model
+## 7. Security Model
 
 Security relies on:
 
@@ -152,27 +214,11 @@ Then:
 
 ---
 
-## 7. Why Not Use Spot Directly?
-
-Spot price:
-- Reflects current price
-- Can differ significantly from 12h VWAP in trending markets
-
-Using spot as settlement:
-- Breaks fairness of delayed settlement
-- Introduces volatility exposure
-
-Using spot only as sanity reference:
-- Prevents extreme mispricing
-- Does not override VWAP logic
-
----
-
 ## 8. Trade-Offs
 
 | Property | VWAP | TWAP | Spot |
 |----------|------|------|------|
-| Fair historical execution | ✅ | ⚠️ | ❌ |
+| Fair historical execution | Yes | Partial | No |
 | Trend lag | High | Medium | None |
 | Manipulation resistance | Depends on volume quality | High | Medium |
 | Complexity | High | Medium | Low |
@@ -193,6 +239,7 @@ It is optimized for:
 - Robust 12-hour settlement
 - Deterministic replay
 - Governance-controlled safety
+- On-demand computation (no wasted gas)
 
 ---
 

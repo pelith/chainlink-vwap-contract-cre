@@ -4,12 +4,10 @@ go 1.25.3
 
 require (
 	github.com/ethereum/go-ethereum v1.16.4
-	github.com/shopspring/decimal v1.4.0
 	github.com/smartcontractkit/chainlink-protos/cre/go v0.0.0-20260204183622-63ecea457961
 	github.com/smartcontractkit/cre-sdk-go v1.2.0
 	github.com/smartcontractkit/cre-sdk-go/capabilities/blockchain/evm v1.0.0-beta.5
 	github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http v1.0.0-beta.0
-	github.com/smartcontractkit/cre-sdk-go/capabilities/scheduler/cron v1.0.0-beta.0
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/protobuf v1.36.8
 )
@@ -34,6 +32,7 @@ require (
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/shirou/gopsutil v3.21.4-0.20210419000835-c7a38de76ee5+incompatible // indirect
+	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/supranational/blst v0.3.16-0.20250831170142-f48500c1fdbe // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect

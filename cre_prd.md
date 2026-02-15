@@ -1,80 +1,217 @@
-# Chainlink CRE 12h VWAP 結算系統 PRD (v2.1)
+# Chainlink CRE 12h VWAP 結算系統 PRD (v3.0)
 
 ## 1. 專案目標 (Objective)
-建立一個基於 **Chainlink CRE (Custom Reporting Entity)** 框架的權限化預言機網絡。該系統負責從中心化交易所 (CEX) 獲取原始數據，並透過「中位數去噪」與「最低源數量檢查」產生 12 小時的結算價格。
+建立一個基於 **Chainlink CRE (Custom Reporting Entity)** 框架的權限化預言機網絡，為 RFQ Spot 延遲結算系統提供 12 小時 VWAP 結算價格。
 
-## 2. 開發前置作業 (Pre-requisites)
-
-### 2.1 基礎環境
-- **Go Lang**: 1.21 或更高版本（CRE Workflow 主要以 Go 編寫）。
-- **Chainlink CLI**: 需安裝並配置好與目標節點通訊的 Credentials。
-- **Docker**: 用於本地模擬節點環境測試 Workflow 確定性 (Determinism)。
-
-### 2.2 網絡與權限
-- **Node Address**: 獲取開發節點地址，並確保其已列入鏈上合約的 `Allowlisted Reporters`。
-- **CEX API Access**:
-    - 目標交易所：**Binance, OKX, Bybit, Coinbase, Bitget**。
-    - 交易對：**ETH/USDC**。
-    - 上述交易所的 K 線 API 皆為公開端點，無需 API Key。
+系統採用 **事件驅動（on-demand）** 模式：後端在訂單到期時觸發 CRE Workflow，按需計算特定時間區間的 VWAP 並寫回鏈上。
 
 ---
 
-## 3. 價格生成邏輯 (Price Generation Logic)
+## 2. 系統架構 — 10 步結算流程
+
+```
+1. 用戶呼叫 fill()
+   ↓
+2. 主合約鎖定資金，記錄 startTime, endTime, orderId
+   ↓
+3. 後端監聽 Filled event，紀錄 startTime, endTime, orderId
+   ↓
+4. 後端 cronjob 掃到期的 order（endTime 已過）
+   ↓
+5. 後端觸發 CRE Workflow
+   - 呼叫 MessageEmitter.emitMessage(JSON: {orderId, startTime, endTime})
+   - MessageEmitter 發出 MessageEmitted event
+   - CRE DON 透過 Log Trigger 接收事件
+   ↓
+6. CRE Workflow DON 執行：
+   - 每個節點獨立抓取多個 CEX 數據（指定 startTime~endTime 區間）
+   - 每個節點獨立計算 VWAP
+   - 執行熔斷檢查（coverage gate, outlier scrubbing, staleness, flash crash）
+   - 節點間透過 OCR 共識達成一致
+   - 生成 signed report
+   ↓
+7. Forwarder 將 signed report 寫回鏈上合約
+   - 呼叫合約的 onReport(bytes metadata, bytes report)
+   ↓
+8. 鏈上合約驗證並儲存：
+   - 驗證簽名來自 Chainlink DON
+   - 解析 report：orderId, startTime, endTime, priceE8
+   - 儲存至 mapping: settlements[orderId] = {startTime, endTime, priceE8}
+   - 發出 PriceSettled event
+   ↓
+9. 任何人可以呼叫 settle()
+   - 檢查：endTime 已到 && 價格已確認（settlements[orderId].settled == true）
+   - 按 VWAP 價格 + deltaBps 執行資金結算
+   ↓
+10. 後端監聽結算 log，更新 order 紀錄
+```
+
+---
+
+## 3. 觸發機制
+
+### 3.1 CRE 觸發方式：Log Trigger（非 Cron）
+
+CRE 僅支援兩種觸發方式：**Cron** 和 **Log Trigger**。本系統採用 Log Trigger：
+
+- **MessageEmitter 合約**（已部署）：後端呼叫 `emitMessage(string)` 發出鏈上事件
+- **CRE DON** 監聽 `MessageEmitted` 事件，解析 message JSON 取得結算請求
+- 觸發後 CRE 計算指定時間區間的 VWAP 並寫回鏈上
+
+### 3.2 後端觸發流程
+
+```
+後端 cronjob (每分鐘)
+  → 掃描 endTime < now 且尚未結算的訂單
+  → 呼叫 MessageEmitter.emitMessage('{"orderId":"<id>","startTime":<unix>,"endTime":<unix>}')
+  → CRE DON 收到 event → 開始 VWAP 計算
+```
+
+### 3.3 Settlement Request 格式
+
+MessageEmitter message 內容為 JSON 字串：
+```json
+{
+  "orderId": "123",
+  "startTime": 1700000000,
+  "endTime": 1700043200
+}
+```
+- `orderId`: 訂單 ID（uint256，十進位字串）
+- `startTime`: VWAP 計算起始時間（unix seconds）
+- `endTime`: VWAP 計算結束時間（unix seconds）
+
+---
+
+## 4. 價格生成邏輯 (Price Generation Logic)
+
 系統採用 **「中位數參考去噪法 (Median-Reference Scrubbing)」** 以確保單一交易所故障或惡意操縱不影響最終結算。
 
-### 3.1 處理流程：
-1. **併發數據獲取 (Multi-Venue Fetching)**：
-    - CRE 節點同時向 5 家目標 CEX 請求過去 12 小時的 **15-minute K 線**（共 48 筆/交易所）。
-    - **Stateless 處理**：由於 CRE 是無狀態的，節點需一次性獲取完整 12 小時數據。48 筆在所有交易所的單次 API 限制內。
-2. **初步過濾 (Sanity Filter)**：
-    - **零成交處理**：若該交易所 12h `TotalVolume == 0`，直接剔除。
-    - **完整性檢查**：若 48 筆 K 線中缺失數 > 2 筆（約 5%），剔除該源。
-3. **基準中位數計算 (Median Benchmark)**：
-    - 計算各交易所獨立的 12h VWAP：$VWAP_i = \frac{\sum (Price \times Volume)}{\sum Volume}$。
-    - 取得所有有效 VWAP 的**中位數 (Median)**。
-4. **離群值剔除 (Outlier Scrubbing)**：
-    - 計算各源偏離度：$Deviation_i = \frac{|VWAP_i - Median|}{Median}$。
-    - 若 $Deviation_i > 2\%$ (可調參數)，則剔除該交易所數據。
-5. **最終聚合與計數 (Final Aggregation & Threshold)**：
-    - **核心門檻**：篩選後剩餘的「有效交易所數量」必須 **$\ge 3$**。
-    - 若滿足門檻，則對剩餘數據取成交量加權平均值作為最終 `Price`。
+### 4.1 處理流程
 
-### 3.2 CRE 共識模型
-- 每個 CRE 節點**獨立完成**全部步驟：抓取 → 計算 → 熔斷檢查 → 產出最終 `(price, status)`。
-- 跨節點共識發生在**最終報告層級**，由 CRE DON 對各節點的 `price` 取中位數。
-- 個別 HTTP 回應不做跨節點共識。
+1. **數據獲取**：CRE 節點向 5 家 CEX 請求指定時間區間（startTime~endTime）的 15 分鐘 K 線
+   - 交易所：Binance, OKX, Bybit, Coinbase, Bitget
+   - 交易對：ETH/USDC
+   - 使用各交易所 API 的時間範圍參數取得歷史 K 線
+2. **初步過濾**：
+   - 零成交量：剔除
+   - 缺失 K 線 > 2 筆：剔除
+3. **基準中位數計算**：
+   - 各交易所獨立 VWAP：`VWAP_i = Σ(quoteVol) / Σ(baseVol)`
+   - 取所有有效 VWAP 的中位數
+4. **離群值剔除**：偏離中位數 > 2% 的交易所剔除
+5. **最終聚合**：
+   - 有效交易所 >= 3 家
+   - 對剩餘交易所取成交量加權平均
 
----
+### 4.2 CRE 共識模型
 
-## 4. 熔斷機制 (Circuit Breaker)
-本系統嚴格遵守 **Fail-closed** 原則，若發生以下情況，停止報價並回報錯誤：
-
-- **Min Venues Check**: 有效交易所數量 < 3。
-- **Staleness Check**: 最新一筆 K 線的時間戳與當前時間差 > 30 分鐘。
-- **Flash Crash Protection**: 最終 12h VWAP 與各交易所**最近一根 K 線收盤價的中位數**偏離度 > 15%，視為 VWAP 失效。
+- 每個 CRE 節點**獨立完成**全部步驟：抓取 → 計算 → 熔斷檢查 → 產出 `(price, status)`
+- 跨節點共識發生在**最終報告層級**，由 CRE DON 對各節點的結果取中位數
+- 個別 HTTP 回應不做跨節點共識
 
 ---
 
-## 5. 輸出格式 (Report Schema)
+## 5. 熔斷機制 (Circuit Breaker)
 
-MVP 階段沿用 `ReserveManager` 合約的 `UpdateReserves(totalMinted, totalReserve)` 格式：
+嚴格遵守 **Fail-closed** 原則：
 
-| 欄位名稱 | 映射 | 說明 |
-| :--- | :--- | :--- |
-| `totalReserve` | price | 最終 VWAP 報價（8 位精度，1e8） |
-| `totalMinted` | metadata | 編碼 `(asOf << 16) \| (sourceCount << 8) \| status` |
+| 檢查項目 | 閾值 | 說明 |
+|---------|------|------|
+| Min Venues | >= 3 | 有效交易所數量不足則失敗 |
+| Staleness | 30 分鐘 | 最新 K 線距 endTime 超過 30 分鐘則失敗 |
+| Flash Crash | 15% | VWAP 與最近收盤價中位數偏離超過 15% 則失敗 |
+| Outlier Deviation | 2% | 超過此閾值的交易所被剔除 |
 
-其中 status 定義：
-- `0`: OK
-- `1`: INSUFFICIENT_SOURCES
-- `2`: STALE_DATA
-- `3`: DEVIATION_ERROR
-
-正式版再部署專用合約。
+熔斷時 status != OK，CRE 不產出報告，結算不執行。
 
 ---
 
-## 6. 安全與稽核要求
-- **確定性邏輯 (Deterministic Logic)**：Go 代碼中嚴禁使用 `rand` 或非確定的時間函數，確保 DON 中所有節點計算結果一致。
-- **審計路徑**：Report 中應包含各參與交易所的狀態標記，以便鏈下追蹤哪家交易所被剔除。
-- **密鑰保護**：節點簽章密鑰應受 HSM 保護，不應以明文形式存在於代碼中。
+## 6. 鏈上合約 (On-chain Contracts)
+
+### 6.1 VWAPSettlement 合約
+
+實作 `IReceiver` 介面，接收 CRE signed report：
+
+```solidity
+contract VWAPSettlement is IReceiver {
+    struct Settlement {
+        uint64 startTime;
+        uint64 endTime;
+        uint64 priceE8;
+        bool settled;
+    }
+
+    mapping(uint256 => Settlement) public settlements;
+
+    function onReport(bytes calldata, bytes calldata report) external;
+    function getPrice(uint256 orderId) external view returns (uint64, uint64, uint64);
+    function isSettled(uint256 orderId) external view returns (bool);
+}
+```
+
+### 6.2 Report 編碼格式
+
+複用 `UpdateReserves(uint256 totalMinted, uint256 totalReserve)` 格式：
+
+| 欄位 | 映射 | 說明 |
+|------|------|------|
+| `totalMinted` | orderId | 訂單 ID |
+| `totalReserve` | packed data | `(startTime << 128) \| (endTime << 64) \| priceE8` |
+
+合約端解碼：
+```solidity
+uint256 orderId = totalMinted;
+uint64 startTime = uint64(packed >> 128);
+uint64 endTime = uint64(packed >> 64);
+uint64 priceE8 = uint64(packed);
+```
+
+### 6.3 已部署合約（Sepolia Testnet）
+
+| 合約 | 地址 | 用途 |
+|------|------|------|
+| MessageEmitter | `0x1d598672486ecB50685Da5497390571Ac4E93FDc` | 後端觸發 CRE 的橋接 |
+| ReserveManager | `0x51933aD3A79c770cb6800585325649494120401a` | MVP 接收報告（將替換為 VWAPSettlement） |
+
+---
+
+## 7. CRE Workflow 設計
+
+### 7.1 觸發器
+
+- **Log Trigger**：監聽 MessageEmitter 的 `MessageEmitted` 事件
+- 事件觸發後，解析 message JSON 取得 `{orderId, startTime, endTime}`
+
+### 7.2 動態 URL 構建
+
+根據 startTime/endTime 構建各交易所的歷史 K 線 API URL：
+
+| 交易所 | 時間參數格式 |
+|--------|-------------|
+| Binance | `startTime=<ms>&endTime=<ms>` |
+| OKX | `after=<startMs>&before=<endMs>` |
+| Bybit | `start=<ms>&end=<ms>` |
+| Coinbase | `start=<sec>&end=<sec>` |
+| Bitget | `startTime=<ms>&endTime=<ms>` |
+
+### 7.3 Workflow 流程
+
+```
+MessageEmitted event
+  → 解析 settlement request
+  → 構建動態 exchange URLs（指定時間區間）
+  → 併發請求 5 家交易所
+  → 計算 VWAP + 熔斷檢查
+  → 編碼 report (orderId, packed)
+  → 寫回鏈上 VWAPSettlement 合約
+```
+
+---
+
+## 8. 安全與稽核要求
+
+- **確定性邏輯**：Go 代碼中嚴禁使用 `rand` 或非確定的時間函數
+- **歷史數據模式**：staleness 檢查基於 `endTime`（而非 `time.Now()`），確保節點間一致
+- **密鑰保護**：節點簽章密鑰應受 HSM 保護
+- **Fail-closed**：任何異常情況下不產出報告，寧可延遲結算也不錯誤結算

@@ -1,6 +1,9 @@
 {
-  "schedule": "*/30 * * * * *",
-  "url": "https://api.real-time-reserves.verinumus.io/v1/chainlink/proof-of-reserves/TrueUSD",
+  "deviationThresholdPct": 2.0,
+  "minVenues": 3,
+  "maxStalenessMinutes": 30,
+  "flashCrashPct": 15.0,
+  "maxMissingCandles": 2,
   "evms": [
     {
       "tokenAddress": "0x4700A50d858Cb281847ca4Ee0938F80DEfB3F1dd",
