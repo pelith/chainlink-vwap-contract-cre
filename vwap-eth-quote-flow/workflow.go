@@ -12,11 +12,9 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/blockchain/evm"
-	"github.com/smartcontractkit/cre-sdk-go/capabilities/blockchain/evm/bindings"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http"
 	"github.com/smartcontractkit/cre-sdk-go/cre"
 
-	"chainlink-vwap-cre/contracts/evm/src/generated/message_emitter"
 	"chainlink-vwap-cre/contracts/evm/src/generated/reserve_manager"
 )
 
@@ -26,7 +24,6 @@ type EVMConfig struct {
 	TokenAddress          string `json:"tokenAddress"`
 	ReserveManagerAddress string `json:"reserveManagerAddress"`
 	BalanceReaderAddress  string `json:"balanceReaderAddress"`
-	MessageEmitterAddress string `json:"messageEmitterAddress"`
 	ChainName             string `json:"chainName"`
 	GasLimit              uint64 `json:"gasLimit"`
 }
@@ -51,6 +48,7 @@ type Config struct {
 	MaxStalenessMinutes   int         `json:"maxStalenessMinutes"`
 	FlashCrashPct         float64     `json:"flashCrashPct"`
 	MaxMissingCandles     int         `json:"maxMissingCandles"`
+	AuthorizedKeys        []string    `json:"authorizedKeys"`
 	EVMs                  []EVMConfig `json:"evms"`
 }
 
@@ -92,7 +90,10 @@ const (
 	StatusInsufficientSources int64 = 1
 	StatusStaleData           int64 = 2
 	StatusDeviationError      int64 = 3
+	StatusDataNotReady        int64 = 4
 )
+
+const candleIntervalMs = int64(15 * 60 * 1000)
 
 // Exchange names
 const (
@@ -114,48 +115,31 @@ type SettlementRequest struct {
 // --- Workflow ---
 
 func InitWorkflow(config *Config, logger *slog.Logger, secretsProvider cre.SecretsProvider) (cre.Workflow[*Config], error) {
-	evmCfg := config.EVMs[0]
-
-	evmClient, err := evmCfg.NewEVMClient()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create EVM client: %w", err)
+	// Build authorized keys for HTTP trigger authentication
+	authorizedKeys := make([]*http.AuthorizedKey, len(config.AuthorizedKeys))
+	for i, key := range config.AuthorizedKeys {
+		authorizedKeys[i] = &http.AuthorizedKey{
+			Type:      http.KeyType_KEY_TYPE_ECDSA_EVM,
+			PublicKey: key,
+		}
 	}
 
-	chainSelector, err := evmCfg.GetChainSelector()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get chain selector: %w", err)
-	}
-
-	msgEmitter, err := message_emitter.NewMessageEmitter(
-		evmClient,
-		common.HexToAddress(evmCfg.MessageEmitterAddress),
-		nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create message emitter: %w", err)
-	}
-
-	logTrigger, err := msgEmitter.LogTriggerMessageEmittedLog(
-		chainSelector,
-		evm.ConfidenceLevel_CONFIDENCE_LEVEL_FINALIZED,
-		nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create log trigger: %w", err)
-	}
+	httpTrigger := http.Trigger(&http.Config{
+		AuthorizedKeys: authorizedKeys,
+	})
 
 	workflow := cre.Workflow[*Config]{
-		cre.Handler(logTrigger, onSettlementRequest),
+		cre.Handler(httpTrigger, onSettlementRequest),
 	}
 
 	return workflow, nil
 }
 
-func onSettlementRequest(config *Config, runtime cre.Runtime, outputs *bindings.DecodedLog[message_emitter.MessageEmittedDecoded]) (string, error) {
+func onSettlementRequest(config *Config, runtime cre.Runtime, payload *http.Payload) (string, error) {
 	logger := runtime.Logger()
 
 	var req SettlementRequest
-	if err := json.Unmarshal([]byte(outputs.Data.Message), &req); err != nil {
+	if err := json.Unmarshal(payload.Input, &req); err != nil {
 		return "", fmt.Errorf("failed to parse settlement request: %w", err)
 	}
 
@@ -256,7 +240,7 @@ func buildExchangeURLs(startTimeMs, endTimeMs int64) []exchangeFetch {
 		},
 		{
 			exchangeCoinbase,
-			fmt.Sprintf("https://api.exchange.coinbase.com/products/ETH-USDC/candles?granularity=900&start=%d&end=%d",
+			fmt.Sprintf("https://api.exchange.coinbase.com/products/ETH-USD/candles?granularity=900&start=%d&end=%d",
 				startTimeSec, endTimeSec),
 			parseCoinbase,
 		},
@@ -271,12 +255,22 @@ func buildExchangeURLs(startTimeMs, endTimeMs int64) []exchangeFetch {
 
 func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.SendRequester, startTimeMs, endTimeMs int64) (*VWAPResult, error) {
 	endTimeSec := endTimeMs / 1000
-	expectedCandles := int((endTimeMs - startTimeMs) / (15 * 60 * 1000))
+
+	// Ceil startTime to next 15-min boundary so we only include candles
+	// that started AFTER the order was placed (fairness: no pre-existing data advantage).
+	// If startTime is already aligned, it stays unchanged.
+	queryStartMs := ((startTimeMs + candleIntervalMs - 1) / candleIntervalMs) * candleIntervalMs
+
+	// The last candle that must be present: the one whose interval contains endTime
+	// e.g. endTime=09:12 → required=09:00; endTime=09:00 → required=08:45
+	requiredLastCandleMs := ((endTimeMs - 1) / candleIntervalMs) * candleIntervalMs
+
+	expectedCandles := int((requiredLastCandleMs-queryStartMs)/candleIntervalMs) + 1
 	if expectedCandles < 1 {
 		expectedCandles = 1
 	}
 
-	exchanges := buildExchangeURLs(startTimeMs, endTimeMs)
+	exchanges := buildExchangeURLs(queryStartMs, endTimeMs)
 
 	// Step 1: Fetch all exchanges and parse
 	results := make([]ExchangeResult, 0, len(exchanges))
@@ -298,7 +292,26 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 			continue
 		}
 
-		// Step 2: Initial filtering — missing candles
+		// Normalize: sort candles ascending by OpenTime
+		sort.Slice(candles, func(i, j int) bool {
+			return candles[i].OpenTime < candles[j].OpenTime
+		})
+
+		if len(candles) == 0 {
+			results = append(results, ExchangeResult{Name: ex.name, Valid: false, InvalidReason: "no candles returned"})
+			continue
+		}
+
+		// Step 2: Check if the candle covering endTime is present
+		lastCandle := candles[len(candles)-1]
+		if lastCandle.OpenTime < requiredLastCandleMs {
+			reason := fmt.Sprintf("candle covering endTime not yet available: last=%d, required=%d", lastCandle.OpenTime, requiredLastCandleMs)
+			logger.Warn("exchange filtered", "exchange", ex.name, "reason", reason)
+			results = append(results, ExchangeResult{Name: ex.name, Valid: false, InvalidReason: reason})
+			continue
+		}
+
+		// Step 3: Initial filtering — missing candles
 		missing := expectedCandles - len(candles)
 		if missing > config.MaxMissingCandles {
 			reason := fmt.Sprintf("too many missing candles: %d (max %d)", missing, config.MaxMissingCandles)
@@ -323,7 +336,6 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 		}
 
 		vwap := totalQuoteVol / totalBaseVol
-		lastCandle := candles[len(candles)-1]
 
 		results = append(results, ExchangeResult{
 			Name:            ex.name,
@@ -494,7 +506,6 @@ func parseOKX(data []byte) ([]Candle, error) {
 			QuoteVol: parseFloat(row[6]),
 		})
 	}
-	reverseCandles(candles)
 	return candles, nil
 }
 
@@ -526,7 +537,6 @@ func parseBybit(data []byte) ([]Candle, error) {
 			QuoteVol: parseFloat(row[6]),
 		})
 	}
-	reverseCandles(candles)
 	return candles, nil
 }
 
@@ -564,7 +574,6 @@ func parseCoinbase(data []byte) ([]Candle, error) {
 			QuoteVol: quoteVol,
 		})
 	}
-	reverseCandles(candles)
 	return candles, nil
 }
 
@@ -594,7 +603,6 @@ func parseBitget(data []byte) ([]Candle, error) {
 			QuoteVol: parseFloat(row[6]),
 		})
 	}
-	reverseCandles(candles)
 	return candles, nil
 }
 
@@ -613,12 +621,6 @@ func parseJSONFloat(raw json.RawMessage) float64 {
 		return f
 	}
 	return parseFloat(s)
-}
-
-func reverseCandles(candles []Candle) {
-	for i, j := 0, len(candles)-1; i < j; i, j = i+1, j-1 {
-		candles[i], candles[j] = candles[j], candles[i]
-	}
 }
 
 func medianFloat64(vals []float64) float64 {

@@ -3,7 +3,7 @@
 ## 1. 專案目標 (Objective)
 建立一個基於 **Chainlink CRE (Custom Reporting Entity)** 框架的權限化預言機網絡，為 RFQ Spot 延遲結算系統提供 12 小時 VWAP 結算價格。
 
-系統採用 **事件驅動（on-demand）** 模式：後端在訂單到期時觸發 CRE Workflow，按需計算特定時間區間的 VWAP 並寫回鏈上。
+系統採用 **HTTP Trigger（on-demand）** 模式：後端在訂單到期時透過 HTTP POST 觸發 CRE Workflow，按需計算特定時間區間的 VWAP 並寫回鏈上。不需要鏈上觸發交易，節省 gas。
 
 ---
 
@@ -14,14 +14,14 @@
    ↓
 2. 主合約鎖定資金，記錄 startTime, endTime, orderId
    ↓
-3. 後端監聽 Filled event，紀錄 startTime, endTime, orderId
+3. 後端監聯 Filled event，紀錄 startTime, endTime, orderId
    ↓
-4. 後端 cronjob 掃到期的 order（endTime 已過）
+4. 後端 cronjob 掃到期的 order（endTime 已過且 vwapPrice 為空）
    ↓
-5. 後端觸發 CRE Workflow
-   - 呼叫 MessageEmitter.emitMessage(JSON: {orderId, startTime, endTime})
-   - MessageEmitter 發出 MessageEmitted event
-   - CRE DON 透過 Log Trigger 接收事件
+5. 後端觸發 CRE Workflow（HTTP Trigger）
+   - 用授權私鑰簽署 HTTP POST 至 CRE DON endpoint
+   - Payload: {orderId, startTime, endTime}
+   - CRE 驗證 ECDSA 簽名 → 匹配 authorizedKeys
    ↓
 6. CRE Workflow DON 執行：
    - 每個節點獨立抓取多個 CEX 數據（指定 startTime~endTime 區間）
@@ -50,26 +50,27 @@
 
 ## 3. 觸發機制
 
-### 3.1 CRE 觸發方式：Log Trigger（非 Cron）
+### 3.1 CRE 觸發方式：HTTP Trigger
 
-CRE 僅支援兩種觸發方式：**Cron** 和 **Log Trigger**。本系統採用 Log Trigger：
+CRE 支援三種觸發方式：**Cron**、**Log Trigger**、**HTTP Trigger**。本系統採用 HTTP Trigger：
 
-- **MessageEmitter 合約**（已部署）：後端呼叫 `emitMessage(string)` 發出鏈上事件
-- **CRE DON** 監聽 `MessageEmitted` 事件，解析 message JSON 取得結算請求
-- 觸發後 CRE 計算指定時間區間的 VWAP 並寫回鏈上
+- 後端直接透過 HTTP POST 觸發 CRE Workflow（不需要鏈上交易）
+- 請求需用授權私鑰簽署（ECDSA_EVM），CRE 驗證簽名匹配 `authorizedKeys`
+- Simulate 階段不需要 auth key（空 config 即可），Deploy 時必須設定
 
 ### 3.2 後端觸發流程
 
 ```
 後端 cronjob (每分鐘)
-  → 掃描 endTime < now 且尚未結算的訂單
-  → 呼叫 MessageEmitter.emitMessage('{"orderId":"<id>","startTime":<unix>,"endTime":<unix>}')
-  → CRE DON 收到 event → 開始 VWAP 計算
+  → 掃描鏈上 endTime < now 且 vwapPrice 為空的訂單
+  → 用授權私鑰簽署 HTTP POST 至 CRE DON endpoint
+  → Payload: {"orderId":"<id>","startTime":<unix>,"endTime":<unix>}
+  → CRE DON 驗證簽名 → 開始 VWAP 計算
 ```
 
 ### 3.3 Settlement Request 格式
 
-MessageEmitter message 內容為 JSON 字串：
+HTTP Trigger payload 為 JSON：
 ```json
 {
   "orderId": "123",
@@ -80,6 +81,13 @@ MessageEmitter message 內容為 JSON 字串：
 - `orderId`: 訂單 ID（uint256，十進位字串）
 - `startTime`: VWAP 計算起始時間（unix seconds）
 - `endTime`: VWAP 計算結束時間（unix seconds）
+
+### 3.4 Authorization
+
+| 階段 | authorizedKeys | 觸發方式 |
+|------|---------------|---------|
+| Simulate | 空（不需要） | `cre workflow simulate --http-payload` |
+| Production | EVM address（後端錢包） | 後端用私鑰簽署 HTTP POST |
 
 ---
 
@@ -171,8 +179,8 @@ uint64 priceE8 = uint64(packed);
 
 | 合約 | 地址 | 用途 |
 |------|------|------|
-| MessageEmitter | `0x1d598672486ecB50685Da5497390571Ac4E93FDc` | 後端觸發 CRE 的橋接 |
 | ReserveManager | `0x51933aD3A79c770cb6800585325649494120401a` | MVP 接收報告（將替換為 VWAPSettlement） |
+| VWAPSettlement | 待部署 | 正式接收 CRE signed report 並儲存結算價格 |
 
 ---
 
@@ -180,8 +188,8 @@ uint64 priceE8 = uint64(packed);
 
 ### 7.1 觸發器
 
-- **Log Trigger**：監聽 MessageEmitter 的 `MessageEmitted` 事件
-- 事件觸發後，解析 message JSON 取得 `{orderId, startTime, endTime}`
+- **HTTP Trigger**：後端透過 HTTP POST 直接觸發 CRE Workflow
+- CRE 驗證 ECDSA 簽名後，解析 payload JSON 取得 `{orderId, startTime, endTime}`
 
 ### 7.2 動態 URL 構建
 
@@ -198,7 +206,7 @@ uint64 priceE8 = uint64(packed);
 ### 7.3 Workflow 流程
 
 ```
-MessageEmitted event
+HTTP Trigger payload（{orderId, startTime, endTime}）
   → 解析 settlement request
   → 構建動態 exchange URLs（指定時間區間）
   → 併發請求 5 家交易所

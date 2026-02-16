@@ -27,12 +27,12 @@ It IS intended to:
    ↓
 3. Backend listens to Filled event, records startTime, endTime, orderId
    ↓
-4. Backend cronjob scans for expired orders (endTime has passed)
+4. Backend cronjob scans for expired orders (endTime has passed, vwapPrice empty)
    ↓
-5. Backend triggers CRE Workflow
-   - Calls MessageEmitter.emitMessage(JSON: {orderId, startTime, endTime})
-   - MessageEmitter emits MessageEmitted event
-   - CRE DON picks up event via Log Trigger
+5. Backend triggers CRE Workflow via HTTP Trigger
+   - Sends signed HTTP POST to CRE DON endpoint
+   - Payload: {orderId, startTime, endTime}
+   - CRE verifies ECDSA signature against authorizedKeys
    ↓
 6. CRE Workflow DON executes:
    - Each node independently fetches CEX data (for startTime~endTime range)
@@ -72,15 +72,15 @@ Fail-closed is preferred over wrong settlement.
 
 ### 3.2 On-Demand, Not Continuous
 
-The system operates in **event-driven mode**:
+The system operates in **on-demand mode via HTTP Trigger**:
 - CRE does NOT continuously publish prices
 - CRE computes VWAP only when triggered by a settlement request
 - Each computation targets a specific (startTime, endTime) range
-- This avoids unnecessary gas costs and data staleness issues
+- No on-chain trigger transaction needed — saves gas
 
 The trigger chain:
-- Backend → MessageEmitter.emitMessage() → on-chain event
-- CRE DON → Log Trigger → picks up event → computes → writes back
+- Backend → HTTP POST (ECDSA signed) → CRE DON
+- CRE DON → executes workflow → computes VWAP → writes back on-chain
 
 ---
 
@@ -188,8 +188,8 @@ Implements IReceiver, stores `orderId → {startTime, endTime, priceE8, settled}
 
 ### 6.3 Deployed Contracts (Sepolia)
 
-- MessageEmitter: `0x1d598672486ecB50685Da5497390571Ac4E93FDc`
-- ReserveManager: `0x51933aD3A79c770cb6800585325649494120401a` (MVP, to be replaced)
+- VWAPSettlement: (to be deployed via `contracts/evm/deploy.sh`)
+- ReserveManager: `0x51933aD3A79c770cb6800585325649494120401a` (MVP, to be replaced by VWAPSettlement)
 
 ---
 

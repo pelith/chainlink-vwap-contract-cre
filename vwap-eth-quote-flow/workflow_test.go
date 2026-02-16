@@ -11,19 +11,16 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/blockchain/evm"
-	"github.com/smartcontractkit/cre-sdk-go/capabilities/blockchain/evm/bindings"
 	evmmock "github.com/smartcontractkit/cre-sdk-go/capabilities/blockchain/evm/mock"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http"
 	httpmock "github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http/mock"
 	"github.com/smartcontractkit/cre-sdk-go/cre/testutils"
 	"github.com/stretchr/testify/require"
-
-	"chainlink-vwap-cre/contracts/evm/src/generated/message_emitter"
 )
 
 // Fixed test time range (deterministic)
 var (
-	testStartTime   = int64(1700000000)                // unix seconds
+	testStartTime   = int64(1699999200)                // unix seconds, aligned to 15-min boundary
 	testEndTime     = testStartTime + 12*60*60         // +12 hours
 	testStartTimeMs = testStartTime * 1000             // milliseconds
 	testOrderID     = "42"
@@ -40,19 +37,14 @@ func makeTestConfig(t *testing.T) *Config {
 
 // --- Settlement request helper ---
 
-func makeSettlementLog(orderId string, startTime, endTime int64) *bindings.DecodedLog[message_emitter.MessageEmittedDecoded] {
+func makeHTTPPayload(orderId string, startTime, endTime int64) *http.Payload {
 	msg, _ := json.Marshal(SettlementRequest{
 		OrderID:   orderId,
 		StartTime: startTime,
 		EndTime:   endTime,
 	})
-	return &bindings.DecodedLog[message_emitter.MessageEmittedDecoded]{
-		Log: &evm.Log{},
-		Data: message_emitter.MessageEmittedDecoded{
-			Emitter:   common.Address{},
-			Timestamp: big.NewInt(testEndTime),
-			Message:   string(msg),
-		},
+	return &http.Payload{
+		Input: msg,
 	}
 }
 
@@ -222,7 +214,7 @@ func TestInitWorkflow(t *testing.T) {
 	workflow, err := InitWorkflow(config, runtime.Logger(), nil)
 	require.NoError(t, err)
 
-	require.Len(t, workflow, 1) // log trigger handler
+	require.Len(t, workflow, 1) // http trigger handler
 }
 
 func TestHappyPath(t *testing.T) {
@@ -248,7 +240,7 @@ func TestHappyPath(t *testing.T) {
 	// Mock EVM
 	setupEVMMock(t, config)
 
-	result, err := onSettlementRequest(config, runtime, makeSettlementLog(testOrderID, testStartTime, testEndTime))
+	result, err := onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, testStartTime, testEndTime))
 
 	require.NoError(t, err)
 	require.NotEmpty(t, result)
@@ -283,7 +275,7 @@ func TestOutlierScrubbing(t *testing.T) {
 
 	setupEVMMock(t, config)
 
-	result, err := onSettlementRequest(config, runtime, makeSettlementLog(testOrderID, testStartTime, testEndTime))
+	result, err := onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, testStartTime, testEndTime))
 
 	require.NoError(t, err)
 	require.NotEmpty(t, result)
@@ -318,7 +310,7 @@ func TestInsufficientSources(t *testing.T) {
 
 	setupEVMMock(t, config)
 
-	_, err = onSettlementRequest(config, runtime, makeSettlementLog(testOrderID, testStartTime, testEndTime))
+	_, err = onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, testStartTime, testEndTime))
 
 	// Should fail because only 2 < minVenues(3)
 	require.Error(t, err)
@@ -469,12 +461,12 @@ func TestStaleData(t *testing.T) {
 
 	setupEVMMock(t, config)
 
-	_, err = onSettlementRequest(config, runtime, makeSettlementLog(testOrderID, testStartTime, testEndTime))
+	_, err = onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, testStartTime, testEndTime))
 
 	require.Error(t, err)
 
 	logs := runtime.GetLogs()
-	assertLogContains(t, logs, `msg="stale data"`)
+	assertLogContains(t, logs, "candle covering endTime not yet available")
 }
 
 func TestFlashCrash(t *testing.T) {
@@ -648,12 +640,166 @@ func TestFlashCrash(t *testing.T) {
 
 	setupEVMMock(t, config)
 
-	_, err = onSettlementRequest(config, runtime, makeSettlementLog(testOrderID, testStartTime, testEndTime))
+	_, err = onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, testStartTime, testEndTime))
 
 	require.Error(t, err)
 
 	logs := runtime.GetLogs()
 	assertLogContains(t, logs, `msg="flash crash detected"`)
+}
+
+func TestUnalignedStartTimeCeiled(t *testing.T) {
+	config := makeTestConfig(t)
+	runtime := testutils.NewRuntime(t, testutils.Secrets{
+		"": {},
+	})
+
+	// startTime is 1 minute after alignment → ceil should skip first candle
+	unalignedStart := testStartTime + 60 // +1 min past boundary
+	endTime := unalignedStart + 12*60*60
+	ceiledStartMs := (unalignedStart + 15*60 - 1) / (15 * 60) * (15 * 60) * 1000 // next 15-min boundary in ms
+	// Candles should start from ceiledStartMs, not from floor(unalignedStart)
+	expectedCandles := int((((endTime*1000-1)/(15*60*1000))*(15*60*1000) - ceiledStartMs) / (15 * 60 * 1000)) + 1
+
+	makeBinanceFrom := func(startMs int64, count int, basePrice float64) []byte {
+		rows := make([][]interface{}, count)
+		for i := 0; i < count; i++ {
+			ts := startMs + int64(i)*15*60*1000
+			price := basePrice + float64(i)*0.01
+			vol := 100.0
+			quoteVol := vol * price
+			rows[i] = []interface{}{
+				ts,
+				fmt.Sprintf("%.2f", price),
+				fmt.Sprintf("%.2f", price+1),
+				fmt.Sprintf("%.2f", price-1),
+				fmt.Sprintf("%.2f", price+0.5),
+				fmt.Sprintf("%.4f", vol),
+				ts + 15*60*1000 - 1,
+				fmt.Sprintf("%.4f", quoteVol),
+				100,
+				fmt.Sprintf("%.4f", vol*0.5),
+				fmt.Sprintf("%.4f", quoteVol*0.5),
+				"0",
+			}
+		}
+		data, _ := json.Marshal(rows)
+		return data
+	}
+
+	makeOKXFrom := func(startMs int64, count int, basePrice float64) []byte {
+		rows := make([][]string, count)
+		for i := 0; i < count; i++ {
+			idx := count - 1 - i
+			ts := startMs + int64(idx)*15*60*1000
+			price := basePrice + float64(idx)*0.01
+			vol := 100.0
+			quoteVol := vol * price
+			rows[i] = []string{
+				fmt.Sprintf("%d", ts),
+				fmt.Sprintf("%.2f", price),
+				fmt.Sprintf("%.2f", price+1),
+				fmt.Sprintf("%.2f", price-1),
+				fmt.Sprintf("%.2f", price+0.5),
+				fmt.Sprintf("%.4f", vol),
+				fmt.Sprintf("%.4f", quoteVol),
+			}
+		}
+		resp := struct {
+			Data [][]string `json:"data"`
+		}{Data: rows}
+		data, _ := json.Marshal(resp)
+		return data
+	}
+
+	makeBybitFrom := func(startMs int64, count int, basePrice float64) []byte {
+		rows := make([][]string, count)
+		for i := 0; i < count; i++ {
+			idx := count - 1 - i
+			ts := startMs + int64(idx)*15*60*1000
+			price := basePrice + float64(idx)*0.01
+			vol := 100.0
+			quoteVol := vol * price
+			rows[i] = []string{
+				fmt.Sprintf("%d", ts),
+				fmt.Sprintf("%.2f", price),
+				fmt.Sprintf("%.2f", price+1),
+				fmt.Sprintf("%.2f", price-1),
+				fmt.Sprintf("%.2f", price+0.5),
+				fmt.Sprintf("%.4f", vol),
+				fmt.Sprintf("%.4f", quoteVol),
+			}
+		}
+		resp := struct {
+			Result struct {
+				List [][]string `json:"list"`
+			} `json:"result"`
+		}{}
+		resp.Result.List = rows
+		data, _ := json.Marshal(resp)
+		return data
+	}
+
+	makeCoinbaseFrom := func(startMs int64, count int, basePrice float64) []byte {
+		rows := make([][]interface{}, count)
+		for i := 0; i < count; i++ {
+			idx := count - 1 - i
+			ts := startMs/1000 + int64(idx)*15*60
+			price := basePrice + float64(idx)*0.01
+			vol := 100.0
+			rows[i] = []interface{}{ts, price - 1, price + 1, price, price + 0.5, vol}
+		}
+		data, _ := json.Marshal(rows)
+		return data
+	}
+
+	makeBitgetFrom := func(startMs int64, count int, basePrice float64) []byte {
+		rows := make([][]string, count)
+		for i := 0; i < count; i++ {
+			idx := count - 1 - i
+			ts := startMs + int64(idx)*15*60*1000
+			price := basePrice + float64(idx)*0.01
+			vol := 100.0
+			quoteVol := vol * price
+			rows[i] = []string{
+				fmt.Sprintf("%d", ts),
+				fmt.Sprintf("%.2f", price),
+				fmt.Sprintf("%.2f", price+1),
+				fmt.Sprintf("%.2f", price-1),
+				fmt.Sprintf("%.2f", price+0.5),
+				fmt.Sprintf("%.4f", vol),
+				fmt.Sprintf("%.4f", quoteVol),
+			}
+		}
+		resp := struct {
+			Data [][]string `json:"data"`
+		}{Data: rows}
+		data, _ := json.Marshal(resp)
+		return data
+	}
+
+	httpMock, err := httpmock.NewClientCapability(t)
+	require.NoError(t, err)
+	mocks := map[string][]byte{
+		"binance.com":  makeBinanceFrom(ceiledStartMs, expectedCandles, 2000.0),
+		"okx.com":      makeOKXFrom(ceiledStartMs, expectedCandles, 2000.0),
+		"bybit.com":    makeBybitFrom(ceiledStartMs, expectedCandles, 2000.0),
+		"coinbase.com": makeCoinbaseFrom(ceiledStartMs, expectedCandles, 2000.0),
+		"bitget.com":   makeBitgetFrom(ceiledStartMs, expectedCandles, 2000.0),
+	}
+	httpMock.SendRequest = func(ctx context.Context, input *http.Request) (*http.Response, error) {
+		return routeExchangeMock(input.Url, mocks)
+	}
+
+	setupEVMMock(t, config)
+
+	result, err := onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, unalignedStart, endTime))
+
+	require.NoError(t, err)
+	require.NotEmpty(t, result)
+
+	logs := runtime.GetLogs()
+	assertLogContains(t, logs, `msg="Write report transaction succeeded at"`)
 }
 
 func TestPackSettlement(t *testing.T) {
