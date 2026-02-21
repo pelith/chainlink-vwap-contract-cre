@@ -251,4 +251,27 @@ correctness wins.
 Settlement delay is acceptable.
 Incorrect settlement is not.
 
+---
+
+## 11. CRE CLI Quick Reference
+
+```bash
+# Simulate with file payload (path relative to workflow folder)
+cre workflow simulate vwap-eth-quote-flow \
+  --non-interactive --trigger-index 0 \
+  --http-payload test-payload.json \
+  --target staging-settings
+
+# Simulate with inline JSON
+cre workflow simulate vwap-eth-quote-flow \
+  --non-interactive --trigger-index 0 \
+  --http-payload '{"orderId":"1","startTime":1739552400,"endTime":1739595600}' \
+  --target staging-settings
+```
+
+- HTTP trigger capability ID: `http-trigger@1.0.0-alpha`
+- Simulation: empty `&http.Config{}` OK (no auth needed)
+- Deploy: `AuthorizedKeys` required, CLI rejects without it
+- `http.Payload` fields: `Input []byte` (JSON body), `Key *AuthorizedKey` (verified signer)
+
 claude user language: 繁體中文
