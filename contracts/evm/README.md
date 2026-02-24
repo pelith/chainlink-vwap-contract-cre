@@ -6,7 +6,7 @@
 |---|---|
 | `VWAPRFQSpot.sol` | Main RFQ exchange. Handles `fill` / `settle` / `refund` |
 | `ChainlinkVWAPAdapter.sol` | Production oracle. Receives reports from CRE Forwarder |
-| `ManualVWAPOracle.sol` | Testing oracle. Owner manually injects prices via `setPrice` |
+| `ManualVWAPOracle.sol` | Staging oracle. Accepts prices via CRE Forwarder (`onReport`) and owner backdoor (`setPrice`) |
 | `IVWAPOracle.sol` | Interface shared by both oracle implementations |
 
 ---
@@ -98,5 +98,5 @@ cast call <SPOT_ADDR> \
 
 | Contract | Address |
 |---|---|
-| ManualVWAPOracle | `0x91Da22eD2b7DE3C0132Eba7EdE2826014a24E348` |
-| VWAPRFQSpot | `0x3DD3f762d83C13deb95f49CbE5b2bA470003f025` |
+| ManualVWAPOracle | `0xd7D42352bB9F84c383318044820FE99DC6D60378` |
+| VWAPRFQSpot | `0x61A73573A14898E7031504555c841ea11E7FB07F` |

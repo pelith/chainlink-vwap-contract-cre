@@ -8,7 +8,7 @@
   "evms": [
     {
       "tokenAddress": "0x4700A50d858Cb281847ca4Ee0938F80DEfB3F1dd",
-      "reserveManagerAddress": "0x51933aD3A79c770cb6800585325649494120401a",
+      "reserveManagerAddress": "0xd7D42352bB9F84c383318044820FE99DC6D60378",
       "balanceReaderAddress": "0x4b0739c94C1389B55481cb7506c62430cA7211Cf",
       "chainName": "ethereum-testnet-sepolia",
       "gasLimit": 1000000
