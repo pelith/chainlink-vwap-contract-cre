@@ -1,21 +1,20 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
-	"math/big"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/blockchain/evm"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http"
+	"github.com/smartcontractkit/cre-sdk-go/capabilities/scheduler/cron"
 	"github.com/smartcontractkit/cre-sdk-go/cre"
-
-	"chainlink-vwap-cre/contracts/evm/src/generated/reserve_manager"
 )
 
 // --- Config ---
@@ -78,7 +77,7 @@ type ExchangeResult struct {
 
 type VWAPResult struct {
 	Price       float64 `consensus_aggregation:"median"`
-	PriceE8     int64   `consensus_aggregation:"median"`
+	PriceE6     int64   `consensus_aggregation:"median"`
 	SourceCount int64   `consensus_aggregation:"median"`
 	Status      int64   `consensus_aggregation:"median"`
 	AsOf        int64   `consensus_aggregation:"median"`
@@ -107,15 +106,15 @@ const (
 // --- Settlement Request ---
 
 type SettlementRequest struct {
-	OrderID   string `json:"orderId"`
-	StartTime int64  `json:"startTime"`
-	EndTime   int64  `json:"endTime"`
+	StartTime int64 `json:"startTime"`
+	EndTime   int64 `json:"endTime"`
 }
 
 // --- Workflow ---
 
 func InitWorkflow(config *Config, logger *slog.Logger, secretsProvider cre.SecretsProvider) (cre.Workflow[*Config], error) {
-	// Build authorized keys for HTTP trigger authentication
+	// HTTP trigger — manual / backend-initiated settlement
+	// Payload: {"startTime": unix, "endTime": unix}
 	authorizedKeys := make([]*http.AuthorizedKey, len(config.AuthorizedKeys))
 	for i, key := range config.AuthorizedKeys {
 		authorizedKeys[i] = &http.AuthorizedKey{
@@ -123,19 +122,23 @@ func InitWorkflow(config *Config, logger *slog.Logger, secretsProvider cre.Secre
 			PublicKey: key,
 		}
 	}
-
 	httpTrigger := http.Trigger(&http.Config{
 		AuthorizedKeys: authorizedKeys,
 	})
 
-	workflow := cre.Workflow[*Config]{
-		cre.Handler(httpTrigger, onSettlementRequest),
-	}
+	// Cron trigger — fires every hour on the hour (UTC)
+	// Computes: endTime = top of current hour, startTime = endTime - 12h
+	cronTrigger := cron.Trigger(&cron.Config{Schedule: "0 0 * * * *"})
 
-	return workflow, nil
+	return cre.Workflow[*Config]{
+		cre.Handler(httpTrigger, onHTTPTrigger),
+		cre.Handler(cronTrigger, onCronTrigger),
+	}, nil
 }
 
-func onSettlementRequest(config *Config, runtime cre.Runtime, payload *http.Payload) (string, error) {
+// onHTTPTrigger handles manually-initiated settlements.
+// Expects payload: {"startTime": unix, "endTime": unix}
+func onHTTPTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (string, error) {
 	logger := runtime.Logger()
 
 	var req SettlementRequest
@@ -143,13 +146,30 @@ func onSettlementRequest(config *Config, runtime cre.Runtime, payload *http.Payl
 		return "", fmt.Errorf("failed to parse settlement request: %w", err)
 	}
 
-	logger.Info("settlement request received",
-		"orderId", req.OrderID,
-		"startTime", req.StartTime,
-		"endTime", req.EndTime,
-	)
+	logger.Info("HTTP trigger received", "startTime", req.StartTime, "endTime", req.EndTime)
 
 	return doVWAPSettlement(config, runtime, &req)
+}
+
+// onCronTrigger handles the hourly scheduled settlement.
+// endTime = top of scheduled hour, startTime = endTime - 12h
+func onCronTrigger(config *Config, runtime cre.Runtime, trigger *cron.Payload) (string, error) {
+	logger := runtime.Logger()
+
+	scheduledTime := trigger.ScheduledExecutionTime.AsTime()
+	endTime := scheduledTime.Truncate(time.Hour).Unix()
+	startTime := endTime - 12*3600
+
+	logger.Info("cron trigger fired",
+		"scheduledTime", scheduledTime,
+		"startTime", startTime,
+		"endTime", endTime,
+	)
+
+	return doVWAPSettlement(config, runtime, &SettlementRequest{
+		StartTime: startTime,
+		EndTime:   endTime,
+	})
 }
 
 func doVWAPSettlement(config *Config, runtime cre.Runtime, req *SettlementRequest) (string, error) {
@@ -158,8 +178,7 @@ func doVWAPSettlement(config *Config, runtime cre.Runtime, req *SettlementReques
 	startTimeMs := req.StartTime * 1000
 	endTimeMs := req.EndTime * 1000
 
-	logger.Info("computing VWAP for settlement",
-		"orderId", req.OrderID,
+	logger.Info("computing VWAP",
 		"startTimeMs", startTimeMs,
 		"endTimeMs", endTimeMs,
 	)
@@ -174,26 +193,21 @@ func doVWAPSettlement(config *Config, runtime cre.Runtime, req *SettlementReques
 
 	logger.Info("VWAP result",
 		"price", vwapResult.Price,
-		"priceE8", vwapResult.PriceE8,
+		"priceE6", vwapResult.PriceE6,
 		"sourceCount", vwapResult.SourceCount,
 		"status", vwapResult.Status,
 	)
 
 	if vwapResult.Status != StatusOK {
-		logger.Error("VWAP status not OK", "status", vwapResult.Status)
+		logger.Error("VWAP status not OK — fail closed, no on-chain write", "status", vwapResult.Status)
 		return "", fmt.Errorf("VWAP status not OK: %d", vwapResult.Status)
 	}
 
-	orderId, packed := packSettlement(req.OrderID, req.StartTime, req.EndTime, vwapResult.PriceE8)
-	if orderId == nil {
-		return "", fmt.Errorf("invalid orderId: %s", req.OrderID)
+	if err := writeVWAPReport(config, runtime, req.StartTime, req.EndTime, vwapResult.PriceE6); err != nil {
+		return "", fmt.Errorf("failed to write VWAP report: %w", err)
 	}
 
-	if err := updateReserves(config, runtime, orderId, packed); err != nil {
-		return "", fmt.Errorf("failed to write settlement: %w", err)
-	}
-
-	return fmt.Sprintf("%.8f", vwapResult.Price), nil
+	return fmt.Sprintf("%.6f", vwapResult.Price), nil
 }
 
 // --- VWAP Computation ---
@@ -258,11 +272,9 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 
 	// Ceil startTime to next 15-min boundary so we only include candles
 	// that started AFTER the order was placed (fairness: no pre-existing data advantage).
-	// If startTime is already aligned, it stays unchanged.
 	queryStartMs := ((startTimeMs + candleIntervalMs - 1) / candleIntervalMs) * candleIntervalMs
 
 	// The last candle that must be present: the one whose interval contains endTime
-	// e.g. endTime=09:12 → required=09:00; endTime=09:00 → required=08:45
 	requiredLastCandleMs := ((endTimeMs - 1) / candleIntervalMs) * candleIntervalMs
 
 	expectedCandles := int((requiredLastCandleMs-queryStartMs)/candleIntervalMs) + 1
@@ -292,7 +304,6 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 			continue
 		}
 
-		// Normalize: sort candles ascending by OpenTime
 		sort.Slice(candles, func(i, j int) bool {
 			return candles[i].OpenTime < candles[j].OpenTime
 		})
@@ -302,7 +313,6 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 			continue
 		}
 
-		// Step 2: Check if the candle covering endTime is present
 		lastCandle := candles[len(candles)-1]
 		if lastCandle.OpenTime < requiredLastCandleMs {
 			reason := fmt.Sprintf("candle covering endTime not yet available: last=%d, required=%d", lastCandle.OpenTime, requiredLastCandleMs)
@@ -311,7 +321,6 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 			continue
 		}
 
-		// Step 3: Initial filtering — missing candles
 		missing := expectedCandles - len(candles)
 		if missing > config.MaxMissingCandles {
 			reason := fmt.Sprintf("too many missing candles: %d (max %d)", missing, config.MaxMissingCandles)
@@ -320,7 +329,6 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 			continue
 		}
 
-		// Compute per-exchange VWAP = Σ(quoteVol) / Σ(baseVol)
 		var totalBaseVol, totalQuoteVol float64
 		for _, c := range candles {
 			if c.BaseVol <= 0 {
@@ -349,7 +357,7 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 		})
 	}
 
-	// Step 3: Collect valid results
+	// Step 2: Collect valid results
 	valid := make([]ExchangeResult, 0)
 	for _, r := range results {
 		if r.Valid {
@@ -362,14 +370,14 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 		return &VWAPResult{Status: StatusInsufficientSources, AsOf: endTimeSec}, nil
 	}
 
-	// Step 4: Compute median VWAP for outlier detection
+	// Step 3: Compute median VWAP for outlier detection
 	vwaps := make([]float64, len(valid))
 	for i, r := range valid {
 		vwaps[i] = r.VWAP
 	}
 	medianVWAP := medianFloat64(vwaps)
 
-	// Step 5: Outlier scrubbing — remove exchanges deviating >deviationThresholdPct from median
+	// Step 4: Outlier scrubbing
 	scrubbed := make([]ExchangeResult, 0)
 	for _, r := range valid {
 		deviation := math.Abs(r.VWAP-medianVWAP) / medianVWAP * 100.0
@@ -380,13 +388,13 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 		scrubbed = append(scrubbed, r)
 	}
 
-	// Step 6: Check min venues after scrubbing
+	// Step 5: Check min venues after scrubbing
 	if len(scrubbed) < config.MinVenues {
 		logger.Error("insufficient sources after scrubbing", "remaining", len(scrubbed), "min", config.MinVenues)
 		return &VWAPResult{Status: StatusInsufficientSources, AsOf: endTimeSec}, nil
 	}
 
-	// Step 7: Staleness check — latest candle must be within maxStalenessMinutes of endTime
+	// Step 6: Staleness check
 	var latestCandleTime int64
 	for _, r := range scrubbed {
 		if r.LastCandleTime > latestCandleTime {
@@ -399,7 +407,7 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 		return &VWAPResult{Status: StatusStaleData, AsOf: endTimeSec}, nil
 	}
 
-	// Step 8: Final aggregation — volume-weighted average of remaining exchanges
+	// Step 7: Final aggregation — volume-weighted average across exchanges
 	var totalQuoteVol, totalBaseVol float64
 	for _, r := range scrubbed {
 		totalQuoteVol += r.TotalQuoteVol
@@ -407,7 +415,7 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 	}
 	finalVWAP := totalQuoteVol / totalBaseVol
 
-	// Step 9: Flash crash check — VWAP vs median of last candle closes
+	// Step 8: Flash crash check
 	closes := make([]float64, len(scrubbed))
 	for i, r := range scrubbed {
 		closes[i] = r.LastCandleClose
@@ -419,35 +427,74 @@ func computeVWAPCore(config *Config, logger *slog.Logger, sendRequester *http.Se
 		return &VWAPResult{Status: StatusDeviationError, AsOf: endTimeSec}, nil
 	}
 
-	priceE8 := int64(math.Round(finalVWAP * 1e8))
+	priceE6 := int64(math.Round(finalVWAP * 1e6))
 
 	return &VWAPResult{
 		Price:       finalVWAP,
-		PriceE8:     priceE8,
+		PriceE6:     priceE6,
 		SourceCount: int64(len(scrubbed)),
 		Status:      StatusOK,
 		AsOf:        endTimeSec,
 	}, nil
 }
 
-// --- Settlement Packing ---
+// --- On-chain write ---
 
-func packSettlement(orderIDStr string, startTimeSec, endTimeSec, priceE8 int64) (*big.Int, *big.Int) {
-	orderId := new(big.Int)
-	_, ok := orderId.SetString(orderIDStr, 10)
-	if !ok {
-		return nil, nil
+// writeVWAPReport submits (startTime, endTime, priceE6) to ChainlinkVWAPAdapter on-chain.
+//
+// Flow:
+//  1. ABI-encode the three uint256 fields as the report payload.
+//  2. Ask the CRE DON to sign the payload via runtime.GenerateReport — this produces a
+//     consensus-signed cre.Report that the on-chain Forwarder can verify.
+//  3. Call evm.Client.WriteReport, which routes through the CRE Forwarder and ultimately
+//     invokes adapter.onReport(metadata, abi.encode(startTime, endTime, price)).
+func writeVWAPReport(config *Config, runtime cre.Runtime, startTime, endTime, priceE6 int64) error {
+	evmCfg := config.EVMs[0]
+	logger := runtime.Logger()
+
+	logger.Info("writing VWAP report on-chain",
+		"startTime", startTime,
+		"endTime", endTime,
+		"priceE6", priceE6,
+	)
+
+	// ABI-encode (uint256, uint256, uint256) — each 32 bytes, big-endian, zero-padded.
+	encoded := abiEncodeUint256x3(startTime, endTime, priceE6)
+
+	// Request F+1 DON signatures on the encoded payload.
+	report, err := runtime.GenerateReport(&cre.ReportRequest{
+		EncodedPayload: encoded,
+	}).Await()
+	if err != nil {
+		return fmt.Errorf("failed to generate report: %w", err)
 	}
 
-	packed := new(big.Int)
-	packed.Lsh(big.NewInt(startTimeSec), 128)
+	evmClient, err := evmCfg.NewEVMClient()
+	if err != nil {
+		return fmt.Errorf("failed to create EVM client for %s: %w", evmCfg.ChainName, err)
+	}
 
-	endShifted := new(big.Int).Lsh(big.NewInt(endTimeSec), 64)
-	packed.Or(packed, endShifted)
+	receiverAddr := common.HexToAddress(evmCfg.ReserveManagerAddress).Bytes()
+	resp, err := evmClient.WriteReport(runtime, &evm.WriteCreReportRequest{
+		Receiver: receiverAddr,
+		Report:   report,
+	}).Await()
+	if err != nil {
+		return fmt.Errorf("failed to write report: %w", err)
+	}
 
-	packed.Or(packed, big.NewInt(priceE8))
+	logger.Info("write report succeeded", "txHash", fmt.Sprintf("0x%x", resp.TxHash))
+	return nil
+}
 
-	return orderId, packed
+// abiEncodeUint256x3 encodes three int64 values as ABI-packed uint256 × 3 (96 bytes total).
+// Each value occupies 32 bytes, big-endian, zero-padded in the upper 24 bytes.
+func abiEncodeUint256x3(a, b, c int64) []byte {
+	buf := make([]byte, 96)
+	binary.BigEndian.PutUint64(buf[24:32], uint64(a))
+	binary.BigEndian.PutUint64(buf[56:64], uint64(b))
+	binary.BigEndian.PutUint64(buf[88:96], uint64(c))
+	return buf
 }
 
 // --- Exchange Parsers ---
@@ -541,7 +588,7 @@ func parseBybit(data []byte) ([]Candle, error) {
 }
 
 // parseCoinbase parses Coinbase candle response (descending, needs reverse).
-// Format: [[time_seconds, low, high, open, close, volume], ...] — LHOCV order, no quoteVol.
+// Format: [[time_seconds, low, high, open, close, volume], ...] — no quoteVol, uses typical price approximation.
 func parseCoinbase(data []byte) ([]Candle, error) {
 	var raw [][]json.Number
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -560,12 +607,11 @@ func parseCoinbase(data []byte) ([]Candle, error) {
 		closePx, _ := row[4].Float64()
 		baseVol, _ := row[5].Float64()
 
-		// Coinbase does not provide quoteVol; approximate with typical price
 		typicalPrice := (high + low + closePx) / 3.0
 		quoteVol := typicalPrice * baseVol
 
 		candles = append(candles, Candle{
-			OpenTime: ts * 1000, // seconds → milliseconds
+			OpenTime: ts * 1000,
 			Open:     open,
 			High:     high,
 			Low:      low,
@@ -635,35 +681,4 @@ func medianFloat64(vals []float64) float64 {
 		return (sorted[n/2-1] + sorted[n/2]) / 2.0
 	}
 	return sorted[n/2]
-}
-
-// --- On-chain write ---
-
-func updateReserves(config *Config, runtime cre.Runtime, totalMinted *big.Int, totalReserve *big.Int) error {
-	evmCfg := config.EVMs[0]
-	logger := runtime.Logger()
-	logger.Info("Writing settlement", "totalMinted", totalMinted, "totalReserve", totalReserve)
-
-	evmClient, err := evmCfg.NewEVMClient()
-	if err != nil {
-		return fmt.Errorf("failed to create EVM client for %s: %w", evmCfg.ChainName, err)
-	}
-
-	reserveManager, err := reserve_manager.NewReserveManager(evmClient, common.HexToAddress(evmCfg.ReserveManagerAddress), nil)
-	if err != nil {
-		return fmt.Errorf("failed to create reserve manager: %w", err)
-	}
-
-	resp, err := reserveManager.WriteReportFromUpdateReserves(runtime, reserve_manager.UpdateReserves{
-		TotalMinted:  totalMinted,
-		TotalReserve: totalReserve,
-	}, nil).Await()
-
-	if err != nil {
-		logger.Error("WriteReport await failed", "error", err, "errorType", fmt.Sprintf("%T", err))
-		return fmt.Errorf("failed to write report: %w", err)
-	}
-	logger.Info("Write report succeeded", "response", resp)
-	logger.Info("Write report transaction succeeded at", "txHash", common.BytesToHash(resp.TxHash).Hex())
-	return nil
 }

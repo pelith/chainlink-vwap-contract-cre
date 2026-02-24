@@ -5,7 +5,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"math/big"
 	"strings"
 	"testing"
 
@@ -20,10 +19,9 @@ import (
 
 // Fixed test time range (deterministic)
 var (
-	testStartTime   = int64(1699999200)                // unix seconds, aligned to 15-min boundary
-	testEndTime     = testStartTime + 12*60*60         // +12 hours
-	testStartTimeMs = testStartTime * 1000             // milliseconds
-	testOrderID     = "42"
+	testStartTime   = int64(1699999200)        // unix seconds, aligned to 15-min boundary
+	testEndTime     = testStartTime + 12*60*60 // +12 hours
+	testStartTimeMs = testStartTime * 1000     // milliseconds
 )
 
 //go:embed config.production.json
@@ -37,9 +35,8 @@ func makeTestConfig(t *testing.T) *Config {
 
 // --- Settlement request helper ---
 
-func makeHTTPPayload(orderId string, startTime, endTime int64) *http.Payload {
+func makeHTTPPayload(startTime, endTime int64) *http.Payload {
 	msg, _ := json.Marshal(SettlementRequest{
-		OrderID:   orderId,
 		StartTime: startTime,
 		EndTime:   endTime,
 	})
@@ -214,7 +211,7 @@ func TestInitWorkflow(t *testing.T) {
 	workflow, err := InitWorkflow(config, runtime.Logger(), nil)
 	require.NoError(t, err)
 
-	require.Len(t, workflow, 1) // http trigger handler
+	require.Len(t, workflow, 2) // http trigger + cron trigger handlers
 }
 
 func TestHappyPath(t *testing.T) {
@@ -240,17 +237,17 @@ func TestHappyPath(t *testing.T) {
 	// Mock EVM
 	setupEVMMock(t, config)
 
-	result, err := onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, testStartTime, testEndTime))
+	result, err := onHTTPTrigger(config, runtime, makeHTTPPayload(testStartTime, testEndTime))
 
 	require.NoError(t, err)
 	require.NotEmpty(t, result)
 
 	// Verify logs
 	logs := runtime.GetLogs()
-	assertLogContains(t, logs, `msg="settlement request received"`)
-	assertLogContains(t, logs, `msg="computing VWAP for settlement"`)
+	assertLogContains(t, logs, `msg="HTTP trigger received"`)
+	assertLogContains(t, logs, `msg="computing VWAP"`)
 	assertLogContains(t, logs, `msg="VWAP result"`)
-	assertLogContains(t, logs, `msg="Write report transaction succeeded at"`)
+	assertLogContains(t, logs, `msg="write report succeeded"`)
 }
 
 func TestOutlierScrubbing(t *testing.T) {
@@ -275,7 +272,7 @@ func TestOutlierScrubbing(t *testing.T) {
 
 	setupEVMMock(t, config)
 
-	result, err := onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, testStartTime, testEndTime))
+	result, err := onHTTPTrigger(config, runtime, makeHTTPPayload(testStartTime, testEndTime))
 
 	require.NoError(t, err)
 	require.NotEmpty(t, result)
@@ -284,7 +281,7 @@ func TestOutlierScrubbing(t *testing.T) {
 	logs := runtime.GetLogs()
 	assertLogContains(t, logs, `msg="outlier scrubbed"`)
 	// Should still succeed with 4 remaining exchanges
-	assertLogContains(t, logs, `msg="Write report transaction succeeded at"`)
+	assertLogContains(t, logs, `msg="write report succeeded"`)
 }
 
 func TestInsufficientSources(t *testing.T) {
@@ -310,7 +307,7 @@ func TestInsufficientSources(t *testing.T) {
 
 	setupEVMMock(t, config)
 
-	_, err = onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, testStartTime, testEndTime))
+	_, err = onHTTPTrigger(config, runtime, makeHTTPPayload(testStartTime, testEndTime))
 
 	// Should fail because only 2 < minVenues(3)
 	require.Error(t, err)
@@ -461,7 +458,7 @@ func TestStaleData(t *testing.T) {
 
 	setupEVMMock(t, config)
 
-	_, err = onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, testStartTime, testEndTime))
+	_, err = onHTTPTrigger(config, runtime, makeHTTPPayload(testStartTime, testEndTime))
 
 	require.Error(t, err)
 
@@ -640,7 +637,7 @@ func TestFlashCrash(t *testing.T) {
 
 	setupEVMMock(t, config)
 
-	_, err = onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, testStartTime, testEndTime))
+	_, err = onHTTPTrigger(config, runtime, makeHTTPPayload(testStartTime, testEndTime))
 
 	require.Error(t, err)
 
@@ -793,34 +790,13 @@ func TestUnalignedStartTimeCeiled(t *testing.T) {
 
 	setupEVMMock(t, config)
 
-	result, err := onSettlementRequest(config, runtime, makeHTTPPayload(testOrderID, unalignedStart, endTime))
+	result, err := onHTTPTrigger(config, runtime, makeHTTPPayload(unalignedStart, endTime))
 
 	require.NoError(t, err)
 	require.NotEmpty(t, result)
 
 	logs := runtime.GetLogs()
-	assertLogContains(t, logs, `msg="Write report transaction succeeded at"`)
-}
-
-func TestPackSettlement(t *testing.T) {
-	orderId, packed := packSettlement("42", 1700000000, 1700043200, 200000000000)
-	require.NotNil(t, orderId)
-	require.NotNil(t, packed)
-	require.Equal(t, int64(42), orderId.Int64())
-
-	// Verify unpacking
-	// startTime = packed >> 128
-	startTime := new(big.Int).Rsh(packed, 128)
-	require.Equal(t, int64(1700000000), startTime.Int64())
-
-	// endTime = (packed >> 64) & ((1<<64)-1)
-	mask64 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 64), big.NewInt(1))
-	endTime := new(big.Int).And(new(big.Int).Rsh(packed, 64), mask64)
-	require.Equal(t, int64(1700043200), endTime.Int64())
-
-	// priceE8 = packed & ((1<<64)-1)
-	priceE8 := new(big.Int).And(packed, mask64)
-	require.Equal(t, int64(200000000000), priceE8.Int64())
+	assertLogContains(t, logs, `msg="write report succeeded"`)
 }
 
 // --- Helpers ---

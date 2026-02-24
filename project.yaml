@@ -28,9 +28,11 @@ staging-settings:
   rpcs:
     - chain-name: ethereum-testnet-sepolia
       url: https://ethereum-sepolia-rpc.publicnode.com
+      forwarder: "0x15fC6ae953E024d975e77382eEeC56A9101f9F88"
 
 # ==========================================================================
 production-settings:
   rpcs:
-    - chain-name: ethereum-testnet-sepolia
-      url: https://ethereum-sepolia-rpc.publicnode.com
+    - chain-name: ethereum-mainnet
+      url: https://ethereum-rpc.publicnode.com
+      forwarder: "0xa3d1ad4ac559a6575a114998affb2fb2ec97a7d9"
