@@ -1,2 +1,6 @@
 *.env
 secrets.yaml
+
+# Foundry build artifacts
+contracts/evm/cache/
+contracts/evm/out/
