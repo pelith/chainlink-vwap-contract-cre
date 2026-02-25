@@ -1,5 +1,11 @@
 # CRE Oracle – Background Knowledge
 
+## Git Commit Rules
+
+- Do NOT add any `Co-Authored-By` trailer to commit messages.
+
+---
+
 ## 1. Why CRE Oracle Exists
 
 CRE Oracle is designed to provide a settlement-grade price source
