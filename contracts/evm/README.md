@@ -51,6 +51,28 @@ Also requires:
 FORWARDER_ADDRESS=0x...   # Chainlink CRE Forwarder address from workflow config
 ```
 
+### Tenderly Virtual TestNet (VTN)
+
+VTN 是 Sepolia 的 fork，`MockKeystoneForwarder`（`0x15fC...`）自動繼承，不需另外部署。
+
+```bash
+# 部署到 VTN（Admin RPC 支援特權操作）
+RPC_URL=$TENDERLY_ADMIN_RPC ORACLE_MODE=manual ./deploy.sh
+```
+
+部署後用 `simulate-and-forward.sh` 走完整 simulate → on-chain 路徑：
+
+```bash
+RPC_URL=$TENDERLY_ADMIN_RPC ./scripts/simulate-and-forward.sh "2026-02-27 02:00"
+```
+
+時間快轉（跳過 12h 等待）：
+
+```bash
+cast rpc evm_increaseTime 43200 --rpc-url $TENDERLY_ADMIN_RPC
+cast rpc evm_mine --rpc-url $TENDERLY_ADMIN_RPC
+```
+
 ---
 
 ## Interact — ManualVWAPOracle
@@ -63,14 +85,14 @@ After deploying in manual mode, inject a price with `cast`:
 cast send <ORACLE_ADDR> \
   "setPrice(uint256,uint256,uint256)" \
   <startTime> <endTime> <price> \
-  --rpc-url $SEPOLIA_RPC_URL \
+  --rpc-url $RPC_URL \
   --private-key $DEPLOYER_PRIVATE_KEY
 
 # Check price is stored
 cast call <ORACLE_ADDR> \
   "getPrice(uint256,uint256)(uint256)" \
   <startTime> <endTime> \
-  --rpc-url $SEPOLIA_RPC_URL
+  --rpc-url $RPC_URL
 ```
 
 ---
@@ -82,14 +104,14 @@ cast call <ORACLE_ADDR> \
 cast send <SPOT_ADDR> \
   "settle(bytes32)" \
   <tradeId> \
-  --rpc-url $SEPOLIA_RPC_URL \
+  --rpc-url $RPC_URL \
   --private-key $DEPLOYER_PRIVATE_KEY
 
 # Check trade status
 cast call <SPOT_ADDR> \
   "getTrade(bytes32)((address,address,bool,uint256,uint256,int32,uint64,uint64,uint8))" \
   <tradeId> \
-  --rpc-url $SEPOLIA_RPC_URL
+  --rpc-url $RPC_URL
 ```
 
 ---

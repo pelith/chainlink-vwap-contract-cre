@@ -464,6 +464,9 @@ func writeVWAPReport(config *Config, runtime cre.Runtime, startTime, endTime, pr
 	// Request F+1 DON signatures on the encoded payload.
 	report, err := runtime.GenerateReport(&cre.ReportRequest{
 		EncodedPayload: encoded,
+		EncoderName:    "evm",
+		SigningAlgo:    "ecdsa",
+		HashingAlgo:    "keccak256",
 	}).Await()
 	if err != nil {
 		return fmt.Errorf("failed to generate report: %w", err)

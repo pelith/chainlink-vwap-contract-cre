@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # ============================================================
-# Deploy VWAP RFQ Spot contracts to Sepolia
+# Deploy VWAP RFQ Spot contracts
 #
 # Required env vars (set in .env or export manually):
-#   DEPLOYER_PRIVATE_KEY   Sepolia funded deployer key (0x...)
+#   DEPLOYER_PRIVATE_KEY   funded deployer key (0x...)
 #
 # Required for ChainlinkVWAPAdapter mode:
 #   FORWARDER_ADDRESS      Chainlink CRE Forwarder address
@@ -13,15 +13,17 @@ set -euo pipefail
 # Optional:
 #   ORACLE_MODE            "chainlink" (default) | "manual"
 #                          manual = deploy ManualVWAPOracle (for testing)
-#   SEPOLIA_RPC_URL        defaults to publicnode
+#   RPC_URL                target RPC (highest priority)
+#   SEPOLIA_RPC_URL        fallback RPC, defaults to publicnode
 #   USDC_ADDRESS           defaults to Circle Sepolia USDC
 #   WETH_ADDRESS           defaults to canonical Sepolia WETH
 #   REFUND_GRACE           grace period in seconds (default: 604800 = 7 days)
 #
 # Usage:
 #   source ../../.env          # load DEPLOYER_PRIVATE_KEY etc.
-#   ORACLE_MODE=manual ./deploy.sh          # test with ManualVWAPOracle
-#   ORACLE_MODE=chainlink ./deploy.sh       # production with CRE adapter
+#   ORACLE_MODE=manual ./deploy.sh                          # Sepolia, ManualVWAPOracle
+#   ORACLE_MODE=chainlink ./deploy.sh                       # Sepolia, CRE adapter
+#   RPC_URL=$TENDERLY_ADMIN_RPC ORACLE_MODE=manual ./deploy.sh  # Tenderly VTN
 # ============================================================
 
 # Load .env from repo root if it exists
@@ -32,7 +34,7 @@ if [ -f "$REPO_ROOT/.env" ]; then
   set -a; source "$REPO_ROOT/.env"; set +a
 fi
 
-RPC_URL="${SEPOLIA_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}"
+RPC_URL="${RPC_URL:-${SEPOLIA_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}}"
 USDC_ADDRESS="${USDC_ADDRESS:-0xFA0bd2B4d6D629AdF683e4DCA310c562bCD98E4E}"
 WETH_ADDRESS="${WETH_ADDRESS:-0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14}"
 REFUND_GRACE="${REFUND_GRACE:-604800}"
@@ -53,7 +55,7 @@ if [ "$ORACLE_MODE" = "chainlink" ] && [ -z "${FORWARDER_ADDRESS:-}" ]; then
 fi
 
 echo "============================================================"
-echo "Deploying to Sepolia"
+echo "Deploying to $RPC_URL"
 echo "  Mode:          $ORACLE_MODE"
 echo "  RPC:           $RPC_URL"
 echo "  USDC:          $USDC_ADDRESS"

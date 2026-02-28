@@ -2,6 +2,22 @@
 
 ---
 
+## Deployment Modes 對照表
+
+| | Hackathon / VTN | Sepolia Staging | Production |
+|---|---|---|---|
+| **Oracle** | `ManualVWAPOracle` | `ManualVWAPOracle` | `ChainlinkVWAPAdapter` |
+| **Forwarder** | `MockKeystoneForwarder` | Real CRE Forwarder | Real CRE Forwarder |
+| **FORWARDER_ADDRESS** | `0x15fC...` (mock, no sig check) | `0xF834...` (Sepolia) | `0x0b93...` (Mainnet) |
+| **價格寫入** | `simulate-and-forward.sh` | `cmd/trigger/`（真實 DON） | `cmd/trigger/`（真實 DON） |
+| **`setPrice()` 後門** | ✅ | ✅ | ❌ |
+| **CRE workflow** | `simulate`（dry-run，不上鏈） | `deploy`（真實 DON 執行） | `deploy`（真實 DON 執行） |
+| **跳過 12h 等待** | `evm_increaseTime` (VTN) | 等待真實時間 | 等待真實時間 |
+
+> **Hackathon / VTN** 模式的設計原則：`MockKeystoneForwarder` 不驗證任何簽名，任何人都可呼叫 `report()`；`ManualVWAPOracle` 保留 `setPrice()` owner 後門方便直接注入測試價格。兩者組合讓整條 simulate → on-chain 路徑可在無 CRE 帳號的環境完整測試。
+
+---
+
 ## 前置需求
 
 - [Foundry](https://getfoundry.sh)（`forge`, `cast`）
@@ -145,12 +161,11 @@ go run ./cmd/trigger/ 1 $START_TIME $END_TIME
 
 ```bash
 ORACLE=<B3 的 ManualVWAPOracle 地址>
-RPC=https://ethereum-sepolia-rpc.publicnode.com
 
 cast call $ORACLE \
   "getPrice(uint256,uint256)(uint256)" \
   $START_TIME $END_TIME \
-  --rpc-url $RPC
+  --rpc-url ${RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}
 ```
 
 回傳非零值即代表 VWAP 已成功寫入。
@@ -177,6 +192,103 @@ cast call $ORACLE \
 
 ---
 
+## Part C — Tenderly VTN 完整 Demo（Hackathon 推薦）
+
+Tenderly Virtual TestNet（VTN）是 Sepolia 的可程式化 fork，支援時間快轉（`evm_increaseTime`）和餘額設定（`tenderly_setErc20Balance`），不需要等待真實鏈上時間。
+
+### C1. 建立 Tenderly VTN
+
+1. 登入 [Tenderly Dashboard](https://dashboard.tenderly.co)
+2. 左側選 **Virtual TestNets** → **Create Virtual TestNet**
+3. 選 **Sepolia** 作為 parent network，Fork block 選最新
+4. 建立後，進入 VTN 頁面 → **RPC URLs** → 複製 **Admin RPC URL**
+
+### C2. 設定環境變數
+
+在 `.env` 加入：
+
+```bash
+TENDERLY_ADMIN_RPC=https://virtual.sepolia.rpc.tenderly.co/<vtn-id>/admin
+MANUAL_ORACLE_ADDRESS=   # C3 部署後填入
+```
+
+> Admin RPC 支援時間快轉等特權方法，普通 Public RPC 不支援。
+
+### C3. 在 VTN 上部署合約
+
+```bash
+cd contracts/evm
+RPC_URL=$TENDERLY_ADMIN_RPC ORACLE_MODE=manual ./deploy.sh
+```
+
+將輸出的 `ManualVWAPOracle` 地址填入 `.env`：
+
+```bash
+MANUAL_ORACLE_ADDRESS=0x<C3 輸出的地址>
+```
+
+> VTN fork 自 Sepolia，`MockKeystoneForwarder`（`0x15fC...`）已自動繼承，無需另外部署。`FORWARDER_ADDRESS` 保持預設即可。
+
+### C4. 執行 Simulate → On-chain
+
+`simulate-and-forward.sh` 會完整走過：
+
+1. `cre workflow simulate`（dry-run，從交易所拉資料、計算 VWAP）
+2. 解析 `priceE6` 和 `status`
+3. 構造 `rawReport`，呼叫 `MockKeystoneForwarder.report()` → `oracle.onReport()`
+
+```bash
+# 指定 endTime（會自動 floor 到整點，startTime = endTime - 12h）
+RPC_URL=$TENDERLY_ADMIN_RPC ./scripts/simulate-and-forward.sh "2026-02-27 02:00"
+
+# 或用現在時間
+RPC_URL=$TENDERLY_ADMIN_RPC ./scripts/simulate-and-forward.sh
+```
+
+預期輸出（最後幾行）：
+```
+Done. Report routed through MockKeystoneForwarder → onReport().
+  Forwarder: 0x15fC6ae953E024d975e77382eEeC56A9101f9F88
+  Oracle:    0x<MANUAL_ORACLE_ADDRESS>
+  PriceE6:   2345678901
+```
+
+### C5. 驗證鏈上結果
+
+```bash
+cast call $MANUAL_ORACLE_ADDRESS \
+  "getPrice(uint256,uint256)(uint256)" \
+  $START_TIME $END_TIME \
+  --rpc-url $TENDERLY_ADMIN_RPC
+```
+
+回傳非零值即代表 VWAP 已成功寫入。
+
+### C6. （選用）快轉時間
+
+若需要測試 RFQ 結算（需等 `endTime` 過後才能 `settle()`），可用 VTN Admin RPC 快轉：
+
+```bash
+# 快轉 12 小時（43200 秒）
+cast rpc evm_increaseTime 43200 --rpc-url $TENDERLY_ADMIN_RPC
+cast rpc evm_mine --rpc-url $TENDERLY_ADMIN_RPC
+```
+
+### C7. （選用）設定代幣餘額
+
+若需測試 RFQ 交易，可用 Tenderly 特權方法直接設定 ERC-20 餘額：
+
+```bash
+# 設定地址持有 10000 USDC（6 decimals）
+cast rpc tenderly_setErc20Balance \
+  "<USDC_ADDRESS>" \
+  "<YOUR_ADDRESS>" \
+  "0x2386F26FC10000" \
+  --rpc-url $TENDERLY_ADMIN_RPC
+```
+
+---
+
 ## 疑難排解
 
 | 問題 | 可能原因 |
@@ -186,3 +298,7 @@ cast call $ORACLE \
 | `authorizedKeys` 報錯 | 地址需帶 `0x` 前綴，用 `./derive-address` 確認 |
 | B7 查不到結果 | 多等幾分鐘，或檢查 CRE dashboard 的 workflow logs |
 | `cmd/trigger` 連線失敗 | 確認 `CRE_ENDPOINT_URL` 正確（來自 B5 deploy 輸出）|
+| `simulate-and-forward.sh` 解析失敗 | `cre workflow simulate` 輸出可能為警告，需確認 `VWAP result` 那行有出現 |
+| VTN 上 `cast code` 回傳空 | VTN fork 時間早於合約部署，需在 VTN 上重新 deploy（見 C3）|
+| `ReportProcessed result=false` | `MANUAL_ORACLE_ADDRESS` 填錯，確認 bytecode 含 `onReport` selector（`cast code \| grep 805f2132`）|
+| `evm_increaseTime` 失敗 | 確認使用 Admin RPC（不是 Public RPC）；Admin URL 含 `/admin` 後綴 |
