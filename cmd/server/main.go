@@ -7,16 +7,31 @@
 //   POST /settle          run simulate + forward rawReport on-chain
 //   GET  /health          liveness check
 //
+// POST /settle behaviour:
+//   No body (backfill mode):
+//     Checks last 12 hourly slots via oracle.getPrice().
+//     For each slot with no price: runs cre simulate then sends rawReport.
+//     15s delay between each simulate call to avoid exchange rate-limits.
+//   Body {"endTime": <unix>} (single mode):
+//     Checks oracle for that slot. If price exists returns it immediately.
+//     If missing: runs simulate + sends rawReport. No backfill.
+//
+// Slot definition:
+//   endTime   = hourly boundary (floor to hour)
+//   startTime = endTime - 12h
+//   e.g. now=01:01 → slots at endTime 01:00, 00:00, 23:00, 22:00, ...
+//
 // Required env vars:
 //   RPC_URL                  EVM RPC endpoint (Sepolia or Tenderly VTN)
 //   MANUAL_ORACLE_ADDRESS    ManualVWAPOracle contract address
 //   DEPLOYER_PRIVATE_KEY     Signs the on-chain transaction
 //
 // Optional env vars:
-//   SETTLER_ADDR             Listen address (default :8081)
-//   FORWARDER_ADDRESS        MockKeystoneForwarder (default 0x15fC... Sepolia mock)
-//   CRE_REPO_DIR             Working dir for `cre workflow simulate` (default .)
-//   SETTLER_COOLDOWN_MIN     Rate-limit window in minutes (default 10)
+//   SETTLER_ADDR                  Listen address (default :8081)
+//   FORWARDER_ADDRESS             MockKeystoneForwarder (default 0x15fC... Sepolia mock)
+//   CRE_REPO_DIR                  Working dir for `cre workflow simulate` (default .)
+//   SETTLER_COOLDOWN_MIN          Rate-limit window in minutes (default 10)
+//   SETTLER_SIMULATE_INTERVAL_SEC Delay between simulate calls in seconds (default 15)
 package main
 
 import (
@@ -50,19 +65,26 @@ const forwarderABIJSON = `[{"name":"report","type":"function","inputs":[
 	{"name":"signatures","type":"bytes[]"}
 ]}]`
 
+// ManualVWAPOracle ABI — getPrice(uint256 startTime, uint256 endTime) returns (uint256)
+const oracleABIJSON = `[{"name":"getPrice","type":"function","stateMutability":"view","inputs":[
+	{"name":"startTime","type":"uint256"},
+	{"name":"endTime","type":"uint256"}
+],"outputs":[{"name":"","type":"uint256"}]}]`
+
 var (
 	rePriceE6 = regexp.MustCompile(`priceE6=(\d+)`)
 	reStatus  = regexp.MustCompile(`\bstatus=(\d+)`)
 )
 
 type config struct {
-	addr            string
-	rpcURL          string
-	forwarderAddr   common.Address
-	oracleAddr      common.Address
-	deployerPrivKey string
-	creRepoDir      string
-	cooldown        time.Duration
+	addr             string
+	rpcURL           string
+	forwarderAddr    common.Address
+	oracleAddr       common.Address
+	deployerPrivKey  string
+	creRepoDir       string
+	cooldown         time.Duration
+	simulateInterval time.Duration
 }
 
 type server struct {
@@ -77,11 +99,34 @@ type settleRequest struct {
 	EndTime *int64 `json:"endTime,omitempty"`
 }
 
-type settleResponse struct {
+// single mode: one slot
+type singleResponse struct {
+	StartTime      int64  `json:"startTime"`
+	EndTime        int64  `json:"endTime"`
+	PriceE6        uint64 `json:"priceE6"`
+	TxHash         string `json:"txHash,omitempty"`
+	AlreadySettled bool   `json:"alreadySettled"`
+}
+
+// backfill mode: multiple slots
+type slotResult struct {
 	StartTime int64  `json:"startTime"`
 	EndTime   int64  `json:"endTime"`
 	PriceE6   uint64 `json:"priceE6"`
 	TxHash    string `json:"txHash"`
+}
+
+type slotError struct {
+	StartTime int64  `json:"startTime"`
+	EndTime   int64  `json:"endTime"`
+	Error     string `json:"error"`
+}
+
+type backfillResponse struct {
+	Checked        int          `json:"checked"`
+	AlreadySettled int          `json:"alreadySettled"`
+	Settled        []slotResult `json:"settled"`
+	Errors         []slotError  `json:"errors,omitempty"`
 }
 
 // ---- main ----
@@ -93,15 +138,22 @@ func main() {
 			cooldownMin = n
 		}
 	}
+	simulateIntervalSec := 15
+	if v := os.Getenv("SETTLER_SIMULATE_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			simulateIntervalSec = n
+		}
+	}
 
 	cfg := config{
-		addr:            getEnv("SETTLER_ADDR", ":8081"),
-		rpcURL:          mustEnv("RPC_URL"),
-		forwarderAddr:   common.HexToAddress(getEnv("FORWARDER_ADDRESS", "0x15fC6ae953E024d975e77382eEeC56A9101f9F88")),
-		oracleAddr:      common.HexToAddress(mustEnv("MANUAL_ORACLE_ADDRESS")),
-		deployerPrivKey: mustEnv("DEPLOYER_PRIVATE_KEY"),
-		creRepoDir:      getEnv("CRE_REPO_DIR", "."),
-		cooldown:        time.Duration(cooldownMin) * time.Minute,
+		addr:             getEnv("SETTLER_ADDR", ":8081"),
+		rpcURL:           mustEnv("RPC_URL"),
+		forwarderAddr:    common.HexToAddress(getEnv("FORWARDER_ADDRESS", "0x15fC6ae953E024d975e77382eEeC56A9101f9F88")),
+		oracleAddr:       common.HexToAddress(mustEnv("MANUAL_ORACLE_ADDRESS")),
+		deployerPrivKey:  mustEnv("DEPLOYER_PRIVATE_KEY"),
+		creRepoDir:       getEnv("CRE_REPO_DIR", "."),
+		cooldown:         time.Duration(cooldownMin) * time.Minute,
+		simulateInterval: time.Duration(simulateIntervalSec) * time.Second,
 	}
 
 	s := &server{cfg: cfg}
@@ -116,6 +168,7 @@ func main() {
 		"forwarder", cfg.forwarderAddr,
 		"creRepoDir", cfg.creRepoDir,
 		"cooldown", cfg.cooldown,
+		"simulateInterval", cfg.simulateInterval,
 	)
 	if err := http.ListenAndServe(cfg.addr, mux); err != nil {
 		slog.Error("server failed", "error", err)
@@ -139,49 +192,55 @@ func (s *server) handleSettle(w http.ResponseWriter, r *http.Request) {
 	s.lastTrigger = time.Now()
 	s.mu.Unlock()
 
-	// Parse optional body
 	var req settleRequest
 	if r.Body != nil {
 		json.NewDecoder(r.Body).Decode(&req) //nolint:errcheck // body is optional
 	}
 
-	// Compute time window: floor to hour, 12h window
-	ref := time.Now().Unix()
-	if req.EndTime != nil {
-		ref = *req.EndTime
-	}
-	endTime := (ref / 3600) * 3600
-	startTime := endTime - 12*3600
-
-	// Use a generous timeout — cre simulate fetches from 5 exchanges
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	// Generous timeout: backfill can run up to 12 simulates × (15s delay + ~60s simulate)
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Minute)
 	defer cancel()
 
-	slog.Info("settle triggered",
-		"startTime", startTime,
-		"endTime", endTime,
-		"startUTC", time.Unix(startTime, 0).UTC().Format("2006-01-02 15:04"),
-		"endUTC", time.Unix(endTime, 0).UTC().Format("2006-01-02 15:04"),
-	)
-
-	// Step 1: CRE simulate
-	priceE6, err := s.runSimulate(ctx, startTime, endTime)
+	client, err := ethclient.DialContext(ctx, s.cfg.rpcURL)
 	if err != nil {
-		slog.Error("simulate failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("dial rpc: %v", err)})
+		return
+	}
+	defer client.Close()
+
+	if req.EndTime != nil {
+		s.handleSingle(w, ctx, client, *req.EndTime)
+	} else {
+		s.handleBackfill(w, ctx, client)
+	}
+}
+
+// handleSingle checks one slot and runs simulate if price is missing.
+func (s *server) handleSingle(w http.ResponseWriter, ctx context.Context, client *ethclient.Client, endTimeRaw int64) {
+	endTime := (endTimeRaw / 3600) * 3600
+	startTime := endTime - 12*3600
+
+	slog.Info("single mode", "startTime", startTime, "endTime", endTime)
+
+	existing, err := s.checkPrice(ctx, client, startTime, endTime)
+	if err == nil && existing > 0 {
+		slog.Info("price already exists", "endTime", endTime, "priceE6", existing)
+		writeJSON(w, http.StatusOK, singleResponse{
+			StartTime:      startTime,
+			EndTime:        endTime,
+			PriceE6:        existing,
+			AlreadySettled: true,
+		})
+		return
+	}
+
+	priceE6, txHash, err := s.simulateAndSend(ctx, client, startTime, endTime)
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
-	// Step 2: forward rawReport on-chain
-	txHash, err := s.sendReport(ctx, startTime, endTime, priceE6)
-	if err != nil {
-		slog.Error("send report failed", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-
-	slog.Info("settle done", "priceE6", priceE6, "txHash", txHash)
-	writeJSON(w, http.StatusOK, settleResponse{
+	writeJSON(w, http.StatusOK, singleResponse{
 		StartTime: startTime,
 		EndTime:   endTime,
 		PriceE6:   priceE6,
@@ -189,12 +248,126 @@ func (s *server) handleSettle(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleBackfill checks last 12 hourly slots and fills any missing prices.
+func (s *server) handleBackfill(w http.ResponseWriter, ctx context.Context, client *ethclient.Client) {
+	now := time.Now().Unix()
+	nowHour := (now / 3600) * 3600
+
+	// 12 slots: endTime = nowHour, nowHour-1h, nowHour-2h, ..., nowHour-11h
+	// startTime = endTime - 12h (each slot is a 12h VWAP window)
+	type slot struct{ start, end int64 }
+	slots := make([]slot, 12)
+	for i := 0; i < 12; i++ {
+		end := nowHour - int64(i)*3600
+		slots[i] = slot{start: end - 12*3600, end: end}
+	}
+
+	slog.Info("backfill mode", "slots", 12, "newestEnd", slots[0].end, "oldestEnd", slots[11].end)
+
+	// Check all prices upfront
+	var missing []slot
+	alreadySettled := 0
+	for _, sl := range slots {
+		price, err := s.checkPrice(ctx, client, sl.start, sl.end)
+		if err != nil || price == 0 {
+			missing = append(missing, sl)
+		} else {
+			alreadySettled++
+		}
+	}
+
+	slog.Info("backfill check done", "alreadySettled", alreadySettled, "missing", len(missing))
+
+	var settled []slotResult
+	var errs []slotError
+
+	for i, sl := range missing {
+		if i > 0 {
+			slog.Info("waiting before next simulate", "delay", s.cfg.simulateInterval, "slot", i+1, "of", len(missing))
+			select {
+			case <-time.After(s.cfg.simulateInterval):
+			case <-ctx.Done():
+				errs = append(errs, slotError{StartTime: sl.start, EndTime: sl.end, Error: "context cancelled"})
+				continue
+			}
+		}
+
+		priceE6, txHash, err := s.simulateAndSend(ctx, client, sl.start, sl.end)
+		if err != nil {
+			slog.Error("slot failed", "startTime", sl.start, "endTime", sl.end, "error", err)
+			errs = append(errs, slotError{StartTime: sl.start, EndTime: sl.end, Error: err.Error()})
+			continue
+		}
+
+		settled = append(settled, slotResult{
+			StartTime: sl.start,
+			EndTime:   sl.end,
+			PriceE6:   priceE6,
+			TxHash:    txHash,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, backfillResponse{
+		Checked:        12,
+		AlreadySettled: alreadySettled,
+		Settled:        settled,
+		Errors:         errs,
+	})
+}
+
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// ---- CRE simulate ----
+// ---- core logic ----
 
+// simulateAndSend runs cre simulate then sends rawReport on-chain.
+func (s *server) simulateAndSend(ctx context.Context, client *ethclient.Client, startTime, endTime int64) (uint64, string, error) {
+	priceE6, err := s.runSimulate(ctx, startTime, endTime)
+	if err != nil {
+		return 0, "", err
+	}
+	txHash, err := s.sendReport(ctx, client, startTime, endTime, priceE6)
+	if err != nil {
+		return 0, "", err
+	}
+	return priceE6, txHash, nil
+}
+
+// checkPrice reads oracle.getPrice(startTime, endTime). Returns 0 if not set.
+func (s *server) checkPrice(ctx context.Context, client *ethclient.Client, startTime, endTime int64) (uint64, error) {
+	parsedABI, err := abi.JSON(strings.NewReader(oracleABIJSON))
+	if err != nil {
+		return 0, fmt.Errorf("parse oracle abi: %w", err)
+	}
+	calldata, err := parsedABI.Pack("getPrice", big.NewInt(startTime), big.NewInt(endTime))
+	if err != nil {
+		return 0, fmt.Errorf("pack getPrice: %w", err)
+	}
+
+	result, err := client.CallContract(ctx, ethereum.CallMsg{
+		To:   &s.cfg.oracleAddr,
+		Data: calldata,
+	}, nil)
+	if err != nil {
+		return 0, fmt.Errorf("call getPrice: %w", err)
+	}
+	if len(result) == 0 {
+		return 0, nil
+	}
+
+	values, err := parsedABI.Unpack("getPrice", result)
+	if err != nil {
+		return 0, fmt.Errorf("unpack getPrice: %w", err)
+	}
+	price, ok := values[0].(*big.Int)
+	if !ok {
+		return 0, fmt.Errorf("unexpected return type from getPrice")
+	}
+	return price.Uint64(), nil
+}
+
+// runSimulate execs `cre workflow simulate` and parses priceE6 from stdout.
 func (s *server) runSimulate(ctx context.Context, startTime, endTime int64) (uint64, error) {
 	payload := fmt.Sprintf(`{"startTime":%d,"endTime":%d}`, startTime, endTime)
 
@@ -206,7 +379,11 @@ func (s *server) runSimulate(ctx context.Context, startTime, endTime int64) (uin
 	)
 	cmd.Dir = s.cfg.creRepoDir
 
-	slog.Info("running cre simulate", "dir", cmd.Dir, "payload", payload)
+	slog.Info("running cre simulate",
+		"startTime", startTime, "endTime", endTime,
+		"startUTC", time.Unix(startTime, 0).UTC().Format("2006-01-02 15:04"),
+		"endUTC", time.Unix(endTime, 0).UTC().Format("2006-01-02 15:04"),
+	)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -219,19 +396,16 @@ func (s *server) runSimulate(ctx context.Context, startTime, endTime int64) (uin
 	if priceMatch == nil || statusMatch == nil {
 		return 0, fmt.Errorf("could not parse VWAP result from simulate output:\n%s", out)
 	}
-
 	if string(statusMatch[1]) != "0" {
 		statusMsg := map[string]string{
-			"1": "InsufficientSources",
-			"2": "StaleData",
-			"3": "DeviationError",
-			"4": "DataNotReady",
+			"1": "InsufficientSources", "2": "StaleData",
+			"3": "DeviationError", "4": "DataNotReady",
 		}
 		msg := statusMsg[string(statusMatch[1])]
 		if msg == "" {
 			msg = "Unknown"
 		}
-		return 0, fmt.Errorf("VWAP status %s (%s) — fail-closed, aborting", string(statusMatch[1]), msg)
+		return 0, fmt.Errorf("VWAP status %s (%s) — fail-closed", string(statusMatch[1]), msg)
 	}
 
 	priceE6, err := strconv.ParseUint(string(priceMatch[1]), 10, 64)
@@ -239,19 +413,12 @@ func (s *server) runSimulate(ctx context.Context, startTime, endTime int64) (uin
 		return 0, fmt.Errorf("parse priceE6: %w", err)
 	}
 
-	slog.Info("simulate result", "priceE6", priceE6)
+	slog.Info("simulate result", "priceE6", priceE6, "startTime", startTime, "endTime", endTime)
 	return priceE6, nil
 }
 
-// ---- on-chain send ----
-
-func (s *server) sendReport(ctx context.Context, startTime, endTime int64, priceE6 uint64) (string, error) {
-	client, err := ethclient.DialContext(ctx, s.cfg.rpcURL)
-	if err != nil {
-		return "", fmt.Errorf("dial rpc: %w", err)
-	}
-	defer client.Close()
-
+// sendReport constructs rawReport and sends it to MockKeystoneForwarder.
+func (s *server) sendReport(ctx context.Context, client *ethclient.Client, startTime, endTime int64, priceE6 uint64) (string, error) {
 	chainID, err := client.ChainID(ctx)
 	if err != nil {
 		return "", fmt.Errorf("get chain id: %w", err)
@@ -263,31 +430,21 @@ func (s *server) sendReport(ctx context.Context, startTime, endTime int64, price
 	}
 	from := crypto.PubkeyToAddress(privKey.PublicKey)
 
-	// Build rawReport: 109 zero bytes + abi.encode(startTime, endTime, priceE6)
-	// Layout matches ManualVWAPOracle.onReport() expectations.
+	// rawReport: 109 zero bytes + abi.encode(startTime, endTime, priceE6)
 	uint256Ty, _ := abi.NewType("uint256", "", nil)
 	encArgs := abi.Arguments{{Type: uint256Ty}, {Type: uint256Ty}, {Type: uint256Ty}}
-	encoded, err := encArgs.Pack(
-		big.NewInt(startTime),
-		big.NewInt(endTime),
-		new(big.Int).SetUint64(priceE6),
-	)
+	encoded, err := encArgs.Pack(big.NewInt(startTime), big.NewInt(endTime), new(big.Int).SetUint64(priceE6))
 	if err != nil {
 		return "", fmt.Errorf("abi encode rawReport payload: %w", err)
 	}
 	rawReport := append(make([]byte, 109), encoded...)
 
-	// Build calldata: MockKeystoneForwarder.report(oracleAddr, rawReport, 0x, [])
+	// calldata: MockKeystoneForwarder.report(oracleAddr, rawReport, 0x, [])
 	parsedABI, err := abi.JSON(strings.NewReader(forwarderABIJSON))
 	if err != nil {
 		return "", fmt.Errorf("parse forwarder abi: %w", err)
 	}
-	calldata, err := parsedABI.Pack("report",
-		s.cfg.oracleAddr,
-		rawReport,
-		[]byte{},
-		[][]byte{},
-	)
+	calldata, err := parsedABI.Pack("report", s.cfg.oracleAddr, rawReport, []byte{}, [][]byte{})
 	if err != nil {
 		return "", fmt.Errorf("pack calldata: %w", err)
 	}
@@ -315,7 +472,7 @@ func (s *server) sendReport(ctx context.Context, startTime, endTime int64, price
 	}
 	baseFee := head.BaseFee
 	if baseFee == nil {
-		baseFee = big.NewInt(1e9) // 1 gwei fallback (non-EIP-1559 chains)
+		baseFee = big.NewInt(1e9)
 	}
 	maxFee := new(big.Int).Add(new(big.Int).Mul(baseFee, big.NewInt(2)), tip)
 
@@ -339,7 +496,6 @@ func (s *server) sendReport(ctx context.Context, startTime, endTime int64, price
 	if err != nil {
 		return "", fmt.Errorf("sign tx: %w", err)
 	}
-
 	if err := client.SendTransaction(ctx, signedTx); err != nil {
 		return "", fmt.Errorf("send tx: %w", err)
 	}
