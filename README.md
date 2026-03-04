@@ -71,7 +71,7 @@ flowchart TB
 | | Staging (current) | Production |
 |-|-------------------|------------|
 | Oracle | `ManualVWAPOracle` | `ChainlinkVWAPAdapter` |
-| Forwarder | `MockKeystoneForwarder` | CRE Forwarder |
+| Forwarder | [`MockKeystoneForwarder`](https://docs.chain.link/cre/guides/workflow/using-evm-client/onchain-write/building-consumer-contracts) (Chainlink-provided) | CRE Forwarder |
 | Signature verification | None | F+1 DON signatures |
 | Report source | `simulate-and-forward.sh` | Live CRE DON |
 
@@ -83,7 +83,7 @@ flowchart TB
 |----------|---------|
 | ManualVWAPOracle | [`0xd7D42352bB9F84c383318044820FE99DC6D60378`](https://sepolia.etherscan.io/address/0xd7D42352bB9F84c383318044820FE99DC6D60378) |
 | VWAPRFQSpot | [`0x61A73573A14898E7031504555c841ea11E7FB07F`](https://sepolia.etherscan.io/address/0x61A73573A14898E7031504555c841ea11E7FB07F) |
-| MockKeystoneForwarder | [`0x15fC6ae953E024d975e77382eEeC56A9101f9F88`](https://sepolia.etherscan.io/address/0x15fC6ae953E024d975e77382eEeC56A9101f9F88) |
+| MockKeystoneForwarder (Chainlink) | [`0x15fC6ae953E024d975e77382eEeC56A9101f9F88`](https://sepolia.etherscan.io/address/0x15fC6ae953E024d975e77382eEeC56A9101f9F88) |
 
 ---
 
