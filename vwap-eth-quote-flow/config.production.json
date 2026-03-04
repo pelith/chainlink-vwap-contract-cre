@@ -1,7 +1,7 @@
 {
   "deviationThresholdPct": 2.0,
   "minVenues": 3,
-  "maxStalenessMinutes": 30,
+  "maxStalenessMinutes": 60,
   "flashCrashPct": 15.0,
   "maxMissingCandles": 2,
   "authorizedKeys": [],
