@@ -92,7 +92,7 @@ const (
 	StatusDataNotReady        int64 = 4
 )
 
-const candleIntervalMs = int64(15 * 60 * 1000)
+const candleIntervalMs = int64(60 * 60 * 1000)
 
 // Exchange names
 const (
@@ -236,31 +236,31 @@ func buildExchangeURLs(startTimeMs, endTimeMs int64) []exchangeFetch {
 	return []exchangeFetch{
 		{
 			exchangeBinance,
-			fmt.Sprintf("https://api.binance.com/api/v3/klines?symbol=ETHUSDC&interval=15m&limit=%d&startTime=%d&endTime=%d",
+			fmt.Sprintf("https://api.binance.com/api/v3/klines?symbol=ETHUSDC&interval=1h&limit=%d&startTime=%d&endTime=%d",
 				expectedCandles, startTimeMs, endTimeMs),
 			parseBinance,
 		},
 		{
 			exchangeOKX,
-			fmt.Sprintf("https://www.okx.com/api/v5/market/candles?instId=ETH-USDC&bar=15m&limit=%d&before=%d&after=%d",
+			fmt.Sprintf("https://www.okx.com/api/v5/market/candles?instId=ETH-USDC&bar=1H&limit=%d&before=%d&after=%d",
 				expectedCandles, startTimeMs, endTimeMs),
 			parseOKX,
 		},
 		{
 			exchangeBybit,
-			fmt.Sprintf("https://api.bybit.com/v5/market/kline?category=spot&symbol=ETHUSDC&interval=15&limit=%d&start=%d&end=%d",
+			fmt.Sprintf("https://api.bybit.com/v5/market/kline?category=spot&symbol=ETHUSDC&interval=60&limit=%d&start=%d&end=%d",
 				expectedCandles, startTimeMs, endTimeMs),
 			parseBybit,
 		},
 		{
 			exchangeCoinbase,
-			fmt.Sprintf("https://api.exchange.coinbase.com/products/ETH-USD/candles?granularity=900&start=%d&end=%d",
+			fmt.Sprintf("https://api.exchange.coinbase.com/products/ETH-USD/candles?granularity=3600&start=%d&end=%d",
 				startTimeSec, endTimeSec),
 			parseCoinbase,
 		},
 		{
 			exchangeBitget,
-			fmt.Sprintf("https://api.bitget.com/api/v2/spot/market/candles?symbol=ETHUSDC&granularity=15min&limit=%d&startTime=%d&endTime=%d",
+			fmt.Sprintf("https://api.bitget.com/api/v2/spot/market/candles?symbol=ETHUSDC&granularity=1H&limit=%d&startTime=%d&endTime=%d",
 				expectedCandles, startTimeMs, endTimeMs),
 			parseBitget,
 		},

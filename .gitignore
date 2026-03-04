@@ -1,5 +1,6 @@
 *.env
 secrets.yaml
+CLAUDE.md
 
 # Foundry build artifacts
 contracts/evm/cache/
