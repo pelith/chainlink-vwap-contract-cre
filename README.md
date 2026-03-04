@@ -27,7 +27,7 @@ A spot exchange where trades settle at the **12-hour VWAP price** computed by a 
    → Waits for endTime to pass
 
 3. Backend triggers CRE Workflow (signed HTTP POST)
-   → Payload: { orderId, startTime, endTime }
+   → Payload: { startTime, endTime }
 
 4. CRE DON executes workflow
    → Each node independently fetches Binance/OKX/Bybit/Coinbase/Bitget
@@ -61,7 +61,7 @@ A spot exchange where trades settle at the **12-hour VWAP price** computed by a 
 │   │   └── IVWAPOracle.sol         # Oracle interface
 │   └── deploy.sh               # Deploy script (ORACLE_MODE=manual|chainlink)
 ├── cmd/trigger/                # Backend trigger: signs and sends HTTP POST to CRE DON
-├── SETUP.md                    # Step-by-step deployment and testing guide
+├── scripts/                    # simulate.sh, simulate-and-forward.sh, demo-vtn.sh
 ├── ARCHITECTURE.md             # System design, VWAP logic, circuit breakers
 └── project.yaml                # CRE CLI project settings
 ```
@@ -76,17 +76,21 @@ See [contracts/evm/README.md](./contracts/evm/README.md#deployed-addresses-sepol
 
 ## Quick Start
 
-See [SETUP.md](./SETUP.md) for the full guide.
-
 **Simulate workflow locally (no CRE account needed):**
 ```bash
 cd vwap-eth-quote-flow
 go test -v
 
-cre workflow simulate vwap-eth-quote-flow \
-  --non-interactive --trigger-index 0 \
-  --http-payload test-payload.json \
-  --target staging-settings
+# Simulate past 12h (defaults to now)
+./scripts/simulate.sh
+
+# Simulate specific end time
+./scripts/simulate.sh "2025-02-15 15:00"
+```
+
+**Simulate + write on-chain (MockKeystoneForwarder):**
+```bash
+./scripts/simulate-and-forward.sh
 ```
 
 **Deploy to Sepolia:**
@@ -96,8 +100,8 @@ cd contracts/evm
 ORACLE_MODE=manual ./deploy.sh
 ```
 
-**Trigger CRE Workflow:**
+**Trigger CRE Workflow (production DON):**
 ```bash
 source .env
-go run ./cmd/trigger/ <orderId> <startTime> <endTime>
+go run ./cmd/trigger/ <endTime>
 ```
