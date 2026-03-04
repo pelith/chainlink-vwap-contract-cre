@@ -6,31 +6,28 @@ A settlement-grade 12h VWAP oracle for delayed RFQ spot trading, built on Chainl
 
 ## Settlement Flow
 
-```
-1. Taker calls fill()
-   → Contract locks WETH + USDC, records startTime / endTime (+12h)
+```mermaid
+flowchart TB
+    Maker(["Maker"]) -- "Sign order via<br>EIP-712<br>off-chain" --> OB["Backend: Orderbook<br>"]
+    OB -- Maker cancels --> Cancel["Maker calls<br>cancelOrderHash<br>Order marked as used, cannot be<br>filled"]
+    OB -- Taker accepts order --> Taker(["Taker"])
+    Taker -- Fill order, signature,<br>takerAmountIn --> Contract["VWAPRFQSpot Contract<br>Verify signature<br>Lock maker + taker funds<br>Emit Filled event"]
+    Contract --> Cron["Backend: <br>hourly cron job<br>Scan for expired orders"]
+    Cron -- POST /settle --> Settler["CRE Settler"]
+    Settler --> Binance["Binance"] & OKX["OKX"] & Bybit["Bybit"] & Coinbase["Coinbase"] & Bitget["Bitget"]
+    Binance --> Report["VWAP Price calculation:<br>Filter outliers → Median<br>Build rawReport<br>MockKeystoneForwarder.report"]
+    OKX --> Report
+    Bybit --> Report
+    Coinbase --> Report
+    Bitget --> Report
+    Report --> OnChain["Forwarder:<br>Call VWAPOracle.onReport<br>to stores price"]
+    OnChain -- <br> --> Settle@{ label: "Anyone calls<br>VWAPRFQSpot.settle" }
+    Settle -- No one settles<br>Grace period<br>expired --> Refund("Maker / Taker<br>reclaim original deposits")
+    Settle --> n1@{ label: "Calculate settlement price with base point." }
+    n1 -- Success --> Payout("Maker / Taker<br>receive funds")
 
-2. Backend hourly cron detects expired orders
-   → Calls settler POST /settle
-
-3. Settler triggers CRE Workflow (signed HTTP POST)
-   → Payload: { startTime, endTime }
-
-4. CRE DON executes workflow (each node independently)
-   → Fetches 1h OHLCV candles from Binance, OKX, Bybit, Coinbase, Bitget
-   → Computes VWAP = Σ(quoteVol) / Σ(baseVol)
-   → Circuit breakers: coverage gate (≥3 venues), outlier scrubbing (>2%),
-     staleness (≤60min), flash crash guard (<15%)
-   → OCR consensus → median → signed report
-
-5. Forwarder writes report on-chain
-   → ManualVWAPOracle stores price keyed by (startTime, endTime)
-
-6. Anyone calls settle()
-   → VWAPRFQSpot reads oracle price, applies deltaBps, distributes funds
-
-7. If no one settles within grace period
-   → Anyone calls refund() — both parties reclaim original deposits
+    Settle@{ shape: diamond}
+    n1@{ shape: rect}
 ```
 
 ---
