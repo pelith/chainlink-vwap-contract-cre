@@ -2,7 +2,7 @@
 # demo-vtn.sh
 #
 # Creates 4 orders on Tenderly VTN in different settlement states for demo / grant submission.
-# Uses existing deployed contracts (reads SPOT_ADDRESS + MANUAL_ORACLE_ADDRESS from .env).
+# Deploys contracts fresh on the VTN at startup, then prints addresses to update .env.
 #
 # Final states (frozen at T0+182H, REFUND_GRACE = 7 days):
 #   A  Settled           — filled T0,      oracle price set, settled at T0+13H
@@ -34,9 +34,10 @@
 #
 # Required env:
 #   TENDERLY_ADMIN_RPC       VTN admin RPC endpoint (supports evm_setNextBlockTimestamp)
-#   DEPLOYER_PRIVATE_KEY     Funded deployer on VTN (must be ManualVWAPOracle owner)
-#   SPOT_ADDRESS             Deployed VWAPRFQSpot address
-#   MANUAL_ORACLE_ADDRESS    Deployed ManualVWAPOracle address
+#   DEPLOYER_PRIVATE_KEY     Funded deployer on VTN
+#
+# Optional:
+#   FORWARDER_ADDRESS        MockKeystoneForwarder address (default: Sepolia 0x15fC...F88)
 #
 # Usage:
 #   ./scripts/demo-vtn.sh
@@ -52,9 +53,42 @@ fi
 
 RPC="${TENDERLY_ADMIN_RPC:?TENDERLY_ADMIN_RPC not set}"
 KEY="${DEPLOYER_PRIVATE_KEY:?DEPLOYER_PRIVATE_KEY not set}"
-SPOT="${SPOT_ADDRESS:?SPOT_ADDRESS not set}"
-ORACLE="${MANUAL_ORACLE_ADDRESS:?MANUAL_ORACLE_ADDRESS not set}"
+FORWARDER="${FORWARDER_ADDRESS:-0x15fC6ae953E024d975e77382eEeC56A9101f9F88}"
 DEPLOYER=$(cast wallet address --private-key "$KEY")
+
+# Read fork block timestamp BEFORE any transaction — Tenderly resets block
+# timestamps to wall-clock time on each mined block.
+FORK_NOW=$(cast block latest --field timestamp --rpc-url "$RPC")
+echo "Fork block timestamp: $FORK_NOW ($(date -r "$FORK_NOW" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || date -d "@$FORK_NOW" '+%Y-%m-%d %H:%M %Z'))"
+echo ""
+
+# ─── Deploy contracts on VTN ──────────────────────────────────────────────────
+
+echo "============================================================"
+echo "  Deploying contracts to VTN..."
+echo "  RPC:      $RPC"
+echo "  Deployer: $DEPLOYER"
+echo "============================================================"
+echo ""
+
+DEPLOY_OUTPUT=$(RPC_URL="$RPC" \
+  ORACLE_MODE=manual \
+  FORWARDER_ADDRESS="$FORWARDER" \
+  bash "$SCRIPT_DIR/../contracts/evm/deploy.sh" 2>&1)
+echo "$DEPLOY_OUTPUT"
+echo ""
+
+ORACLE=$(echo "$DEPLOY_OUTPUT" | grep "ManualVWAPOracle deployed at:" | awk '{print $NF}')
+SPOT=$(echo "$DEPLOY_OUTPUT"   | grep "VWAPRFQSpot deployed at:"      | awk '{print $NF}')
+
+if [ -z "$ORACLE" ] || [ -z "$SPOT" ]; then
+  echo "ERROR: Failed to parse deployed contract addresses from deploy.sh output."
+  exit 1
+fi
+
+echo "  => ManualVWAPOracle : $ORACLE"
+echo "  => VWAPRFQSpot      : $SPOT"
+echo ""
 
 REFUND_GRACE=604800       # 7 days — matches deployed contract
 WETH_AMOUNT="1000000000000000000"   # 1 WETH (18 decimals)
@@ -135,13 +169,7 @@ echo "  WETH: $WETH"
 echo ""
 
 # ─── Step 2: Lock in T0 from VTN fork time BEFORE any cast send ──────────────
-# Must read get_now() before any transaction — Tenderly resets block timestamps
-# to wall-clock time on each mined block unless evm_setNextBlockTimestamp is set first.
-# Must call get_now() before any transaction — Tenderly resets block timestamps
-# to wall-clock time on each mined block unless evm_setNextBlockTimestamp is set first.
-
-NOW=$(get_now)
-T0=$(( (NOW / 3600 + 1) * 3600 ))
+T0=$(( (FORK_NOW / 3600 + 1) * 3600 ))
 
 # Derived timestamps (all multiples of 3600 → exact hours)
 TA=$T0                               # A fills at T0+0H
@@ -217,7 +245,7 @@ set_time "$T_SETTLE"
 
 # CRE simulate → MockKeystoneForwarder → onReport() using trade A's actual endTime (rounded up)
 SIM_END_A=$(sim_end_for_trade "$TRADE_ID_A")
-RPC_URL="$RPC" bash "$SCRIPT_DIR/simulate-and-forward.sh" "$SIM_END_A"
+RPC_URL="$RPC" MANUAL_ORACLE_ADDRESS="$ORACLE" bash "$SCRIPT_DIR/simulate-and-forward.sh" "$SIM_END_A"
 
 cast send "$SPOT" "settle(bytes32)" "$TRADE_ID_A" \
   --rpc-url "$RPC" --private-key "$KEY" --quiet
@@ -247,7 +275,7 @@ set_time "$T_FINAL"
 
 # CRE simulate → MockKeystoneForwarder → onReport() using trade B's actual endTime (rounded up)
 SIM_END_B=$(sim_end_for_trade "$TRADE_ID_B")
-RPC_URL="$RPC" bash "$SCRIPT_DIR/simulate-and-forward.sh" "$SIM_END_B"
+RPC_URL="$RPC" MANUAL_ORACLE_ADDRESS="$ORACLE" bash "$SCRIPT_DIR/simulate-and-forward.sh" "$SIM_END_B"
 echo "  Oracle price set for B via CRE simulate (NOT settling — stays Ready to Settle)"
 echo ""
 
@@ -272,4 +300,8 @@ echo "    A: settle() called at T0+13H ✓"
 echo "    B: oracle price set, settle() not called ✓"
 echo "    C: grace expired at $(fmt_time $(( TC + 43200 + REFUND_GRACE ))) (1H before frozen) ✓"
 echo "    D: endTime $(fmt_time $(( TD + 43200 ))) passed (1H before frozen), no oracle price ✓"
+echo ""
+echo "  UPDATE .env WITH THESE ADDRESSES:"
+echo "    MANUAL_ORACLE_ADDRESS=$ORACLE"
+echo "    SPOT_ADDRESS=$SPOT"
 echo "============================================================"

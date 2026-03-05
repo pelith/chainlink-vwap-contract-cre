@@ -39,7 +39,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Save caller-supplied overrides before .env sourcing (source would overwrite them)
+# .env sourcing clobbers any env vars already set in the caller's environment.
+# When demo-vtn.sh invokes this script as:
+#   MANUAL_ORACLE_ADDRESS="$ORACLE" bash simulate-and-forward.sh
+# the caller-supplied address would be overwritten by the stale value in .env.
+# Save it first, then restore after sourcing so the caller's value always wins.
 _SAVE_MANUAL_ORACLE="${MANUAL_ORACLE_ADDRESS:-}"
 
 if [ -f "$REPO_ROOT/.env" ]; then
@@ -47,7 +51,6 @@ if [ -f "$REPO_ROOT/.env" ]; then
   set -a; source "$REPO_ROOT/.env"; set +a
 fi
 
-# Restore caller override if it was set
 [ -n "$_SAVE_MANUAL_ORACLE" ] && MANUAL_ORACLE_ADDRESS="$_SAVE_MANUAL_ORACLE"
 
 RPC_URL="${RPC_URL:-${SEPOLIA_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}}"
