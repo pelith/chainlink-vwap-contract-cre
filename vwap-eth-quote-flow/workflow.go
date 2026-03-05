@@ -235,34 +235,29 @@ func buildExchangeURLs(startTimeMs, endTimeMs int64) []exchangeFetch {
 
 	return []exchangeFetch{
 		{
-			exchangeBinance,
-			fmt.Sprintf("https://api.binance.com/api/v3/klines?symbol=ETHUSDC&interval=1h&limit=%d&startTime=%d&endTime=%d",
-				expectedCandles, startTimeMs, endTimeMs),
-			parseBinance,
+			name:   exchangeBinance,
+			url:    fmt.Sprintf("https://api.binance.com/api/v3/klines?symbol=ETHUSDC&interval=1h&limit=%d&startTime=%d&endTime=%d", expectedCandles, startTimeMs, endTimeMs),
+			parser: parseBinance,
 		},
 		{
-			exchangeOKX,
-			fmt.Sprintf("https://www.okx.com/api/v5/market/candles?instId=ETH-USDC&bar=1H&limit=%d&before=%d&after=%d",
-				expectedCandles, startTimeMs, endTimeMs),
-			parseOKX,
+			name:   exchangeOKX,
+			url:    fmt.Sprintf("https://www.okx.com/api/v5/market/history-candles?instId=ETH-USD&bar=1H&limit=%d&before=%d&after=%d", expectedCandles, startTimeMs, endTimeMs),
+			parser: parseOKX,
 		},
 		{
-			exchangeBybit,
-			fmt.Sprintf("https://api.bybit.com/v5/market/kline?category=spot&symbol=ETHUSDC&interval=60&limit=%d&start=%d&end=%d",
-				expectedCandles, startTimeMs, endTimeMs),
-			parseBybit,
+			name:   exchangeBybit,
+			url:    fmt.Sprintf("https://api.bybit.com/v5/market/kline?category=spot&symbol=ETHUSDC&interval=60&limit=%d&start=%d&end=%d", expectedCandles, startTimeMs, endTimeMs),
+			parser: parseBybit,
 		},
 		{
-			exchangeCoinbase,
-			fmt.Sprintf("https://api.exchange.coinbase.com/products/ETH-USD/candles?granularity=3600&start=%d&end=%d",
-				startTimeSec, endTimeSec),
-			parseCoinbase,
+			name:   exchangeCoinbase,
+			url:    fmt.Sprintf("https://api.exchange.coinbase.com/products/ETH-USD/candles?granularity=3600&start=%d&end=%d", startTimeSec, endTimeSec),
+			parser: parseCoinbase,
 		},
 		{
-			exchangeBitget,
-			fmt.Sprintf("https://api.bitget.com/api/v2/spot/market/candles?symbol=ETHUSDC&granularity=1H&limit=%d&startTime=%d&endTime=%d",
-				expectedCandles, startTimeMs, endTimeMs),
-			parseBitget,
+			name:   exchangeBitget,
+			url:    fmt.Sprintf("https://api.bitget.com/api/v2/spot/market/history-candles?symbol=ETHUSDC&granularity=1h&limit=%d&startTime=%d&endTime=%d", expectedCandles, startTimeMs, endTimeMs),
+			parser: parseBitget,
 		},
 	}
 }

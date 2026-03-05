@@ -39,10 +39,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Save caller-supplied overrides before .env sourcing (source would overwrite them)
+_SAVE_MANUAL_ORACLE="${MANUAL_ORACLE_ADDRESS:-}"
+
 if [ -f "$REPO_ROOT/.env" ]; then
   # shellcheck disable=SC1090
   set -a; source "$REPO_ROOT/.env"; set +a
 fi
+
+# Restore caller override if it was set
+[ -n "$_SAVE_MANUAL_ORACLE" ] && MANUAL_ORACLE_ADDRESS="$_SAVE_MANUAL_ORACLE"
 
 RPC_URL="${RPC_URL:-${SEPOLIA_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}}"
 ORACLE_ADDR="${MANUAL_ORACLE_ADDRESS:?MANUAL_ORACLE_ADDRESS not set}"
